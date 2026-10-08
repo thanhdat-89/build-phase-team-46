@@ -16,9 +16,9 @@ from core.schema import ImageRecord, ObjectRecord
 
 
 
-# â”€â”€ Metadata Taxonomies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-# GöÇGöÇ Metadata Taxonomies GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# ---------------------------------------------------------------------------
+# Metadata Taxonomies
+# ---------------------------------------------------------------------------
 
 # Defined according to Docs/METRIC_CATALOG.md and scene_info_guide/Huong_dan_scene_info_CVAT.md
 KNOWN_TIMEOFDAY: frozenset[str] = frozenset({"day", "night", "dawn_dusk"})
@@ -27,9 +27,9 @@ UNKNOWN_METADATA_VALUE: str = "unknown"
 
 
 
-# â”€â”€ Metadata States â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-# GöÇGöÇ Metadata States GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# ---------------------------------------------------------------------------
+# Metadata States
+# ---------------------------------------------------------------------------
 
 class MetadataState(str, Enum):
     """The four mutually exclusive metadata states defined by project theory:
@@ -47,9 +47,9 @@ class MetadataState(str, Enum):
 
 
 
-# â”€â”€ Bounding Box Failure Reasons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-# GöÇGöÇ Bounding Box Failure Reasons GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# ---------------------------------------------------------------------------
+# Bounding Box Failure Reasons
+# ---------------------------------------------------------------------------
 
 class BBoxFailureReason(str, Enum):
     """Failure reason codes for bounding box geometric validation."""
@@ -66,9 +66,9 @@ class BBoxFailureReason(str, Enum):
 
 
 
-# â”€â”€ Validation Containers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-# GöÇGöÇ Validation Containers GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# ---------------------------------------------------------------------------
+# Validation Containers
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BBoxValidationResult:
@@ -151,9 +151,9 @@ class SceneTagValidationResult:
 
 
 
-# â”€â”€ Bounding Box Validation Logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-# GöÇGöÇ Bounding Box Validation Logic GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# ---------------------------------------------------------------------------
+# Bounding Box Validation Logic
+# ---------------------------------------------------------------------------
 
 def validate_bbox(
     bbox: ObjectRecord,
@@ -235,9 +235,9 @@ def validate_bbox_coordinates(
 
 
 
-# â”€â”€ Metadata Validation Logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-# GöÇGöÇ Metadata Validation Logic GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# ---------------------------------------------------------------------------
+# Metadata Validation Logic
+# ---------------------------------------------------------------------------
 
 def validate_metadata_value(
     field_name: str,
@@ -306,9 +306,9 @@ def validate_weather(value: str | None) -> MetadataValidationResult:
 
 
 
-# â”€â”€ Scene Tag Conflict Detection Logic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-# GöÇGöÇ Scene Tag Conflict Detection Logic GöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇGöÇ
+# ---------------------------------------------------------------------------
+# Scene Tag Conflict Detection Logic
+# ---------------------------------------------------------------------------
 
 def validate_scene_tags(
     scene_tags: list[dict[str, str | None]],
