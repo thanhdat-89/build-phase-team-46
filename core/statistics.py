@@ -1,8 +1,8 @@
-"""Minimal statistics layer for the CVAT annotation dashboard demo.
+﻿"""Statistics and metric calculation layer for N2-05B CVAT Dashboard.
 
-All functions accept lists of ``ImageRecord`` and/or ``ObjectRecord``
-instances and return plain dicts / lists-of-dicts that are easy to
-convert into pandas DataFrames or feed directly into Streamlit widgets.
+Implements Data Profiling (DP01-DP04) and Data Quality (DQ02-DQ06, DQ09) metrics
+strictly adhering to Co_so_ly_thuyet_Data_Quality_Coverage_N2-05B.md and
+Coverage_Recommendation_Engine_Coding_Spec_N2-05B.md.
 """
 
 from __future__ import annotations
@@ -11,53 +11,93 @@ import math
 from collections import Counter
 from typing import Any
 
+
 from core.schema import ImageRecord, ObjectRecord
-from core.validation import validate_bbox
+from core.validation import (
+    KNOWN_TIMEOFDAY,
+    KNOWN_WEATHER,
+    InvalidObjectRecord,
+    MetadataState,
+    MetadataValidationResult,
+    validate_bbox,
+    validate_metadata_value,
+    validate_timeofday,
+    validate_weather,
+)
 
 
 # ---------------------------------------------------------------------------
-# 1. DP01 — Inventory / Dataset summary
+# Metadata classification and ID resolution helpers
+# ---------------------------------------------------------------------------
+
+def classify_field(
+    img: ImageRecord,
+    field_name: str,
+) -> MetadataValidationResult:
+    """Classify a metadata field into known, unknown, missing, or invalid."""
+    if field_name == "timeofday":
+        return validate_timeofday(img.timeofday)
+    if field_name == "weather":
+        return validate_weather(img.weather)
+
+    value = getattr(img, field_name, None)
+    return validate_metadata_value(field_name, value, frozenset())
+
+
+def resolve_obj_image_key(
+    obj: ObjectRecord,
+    images_by_key: dict[str, ImageRecord],
+    images_by_id: dict[str, list[ImageRecord]],
+) -> str:
+    """Resolve an ObjectRecord's parent image key across datasets."""
+    key = obj.image_key
+    if key in images_by_key:
+        return key
+
+    matching_images = images_by_id.get(obj.image_id, [])
+    if len(matching_images) == 1:
+        return matching_images[0].image_key
+
+    return key
+
+
+# ---------------------------------------------------------------------------
+# 1. DP01 — Inventory
 # ---------------------------------------------------------------------------
 
 def dp01_inventory(
     images: list[ImageRecord],
     valid_objects: list[ObjectRecord],
+    all_objects: list[ObjectRecord] | None = None,
 ) -> dict[str, int]:
-    """DP01 — Inventory.
+    """Return inventory counts, separating all boxes from valid boxes.
 
-    Parameters
-    ----------
-    images : list[ImageRecord]
-        All imported image records (N), including unannotated images.
-    valid_objects : list[ObjectRecord]
-        Valid bounding boxes (M_valid). Invalid objects must be excluded.
-
-    Returns
-    -------
-    dict[str, int]
-        Dictionary with:
-        - ``total_images`` (N)
-        - ``total_objects`` (M_valid)
-        - ``total_classes``
-        - ``annotated_image_count``
-        - ``unannotated_image_count``
-        - ``annotated_images`` (alias for backward compatibility)
-        - ``unannotated_images`` (alias for backward compatibility)
+    ``total_objects`` counts all parsed objects when ``all_objects`` is supplied;
+    otherwise it falls back to the valid-object count for backward compatibility.
+    Image coverage is computed using dataset-aware image keys.
     """
     total_images = len(images)
-    total_objects = len(valid_objects)
+    m_valid = len(valid_objects)
+    m_total = len(all_objects) if all_objects is not None else m_valid
 
-    annotated_image_ids = {obj.image_id for obj in valid_objects}
-    annotated_images = len(annotated_image_ids)
+    images_by_key = {img.image_key: img for img in images}
+    images_by_id: dict[str, list[ImageRecord]] = {}
+    for img in images:
+        images_by_id.setdefault(img.image_id, []).append(img)
 
-    all_image_ids = {img.image_id for img in images}
-    unannotated_images = len(all_image_ids - annotated_image_ids)
-
+    annotated_image_keys = {
+        resolve_obj_image_key(obj, images_by_key, images_by_id)
+        for obj in valid_objects
+    }
+    valid_annotated_keys = annotated_image_keys.intersection(images_by_key)
+    annotated_images = len(valid_annotated_keys)
+    unannotated_images = len(set(images_by_key) - valid_annotated_keys)
     total_classes = len({obj.class_name for obj in valid_objects})
 
     return {
         "total_images": total_images,
-        "total_objects": total_objects,
+        "total_objects": m_total,
+        "total_valid_objects": m_valid,
         "total_classes": total_classes,
         "annotated_image_count": annotated_images,
         "unannotated_image_count": unannotated_images,
@@ -70,12 +110,8 @@ def dataset_summary(
     images: list[ImageRecord],
     objects: list[ObjectRecord],
 ) -> dict[str, int]:
-    """Return high-level inventory counts for the dataset.
-
-    Backward-compatible alias for existing tests and UI expecting exact keys:
-    total_images, total_objects, total_classes, annotated_images, unannotated_images.
-    """
-    inv = dp01_inventory(images, objects)
+    """Return legacy inventory counts with the keys expected by the UI/tests."""
+    inv = dp01_inventory(images, objects, all_objects=objects)
     return {
         "total_images": inv["total_images"],
         "total_objects": inv["total_objects"],
@@ -157,6 +193,7 @@ def dp02_class_instance_share(
 # 3. DP03 — Class Image Prevalence
 # ---------------------------------------------------------------------------
 
+
 def dp03_class_image_prevalence(
     images: list[ImageRecord],
     valid_objects: list[ObjectRecord],
@@ -175,25 +212,24 @@ def dp03_class_image_prevalence(
     valid_objects : list[ObjectRecord]
         Valid bounding boxes. Invalid objects must be excluded.
     classes : list[str] | None
-        Optional explicit list of classes. If None, unique classes are discovered
-        from valid_objects.
+        Optional explicit list of classes.
 
     Returns
     -------
     list[dict[str, Any]]
         List of dicts for each class, sorted by image count descending, then class_name.
-        Each dict contains:
-        - ``class_name``: str
-        - ``class_image_count``: int
-        - ``class_image_ratio``: float | None (None when N == 0)
-        - ``status``: str ("available" or "not_available")
-        - ``percentage``: float | None (ratio * 100 or None)
     """
     n = len(images)
 
+    images_by_key = {img.image_key: img for img in images}
+    images_by_id: dict[str, list[ImageRecord]] = {}
+    for img in images:
+        images_by_id.setdefault(img.image_id, []).append(img)
+
     image_sets: dict[str, set[str]] = {}
     for obj in valid_objects:
-        image_sets.setdefault(obj.class_name, set()).add(obj.image_id)
+        key = resolve_obj_image_key(obj, images_by_key, images_by_id)
+        image_sets.setdefault(obj.class_name, set()).add(key)
 
     if classes is not None:
         target_classes = list(classes)
@@ -229,6 +265,7 @@ def dp03_class_image_prevalence(
 # 4. Class distribution (Unified & backward-compatible)
 # ---------------------------------------------------------------------------
 
+
 def class_distribution(
     objects: list[ObjectRecord],
     images: list[ImageRecord] | None = None,
@@ -237,51 +274,32 @@ def class_distribution(
     """Per-class breakdown of object count, image count, percentage, and ratios.
 
     Backward-compatible with existing callers.
-
-    Parameters
-    ----------
-    objects : list[ObjectRecord]
-        All parsed bounding boxes (M), including potentially invalid ones.
-    images : list[ImageRecord] | None
-        All imported image records (N).
-    valid_objects : list[ObjectRecord] | None
-        Optional pre-filtered list of valid bounding boxes (M_valid).
-        If None, valid objects are resolved so that DP02 and DP03 metrics
-        never treat invalid bounding boxes as valid profiling objects.
-
-    Returns
-    -------
-    list[dict[str, Any]]
-        List of dicts containing:
-        - ``class_name``
-        - ``object_count``        -- legacy count of all parsed boxes (M)
-        - ``image_count``         -- legacy count of images with any box (M)
-        - ``percentage``          -- legacy object_count / M * 100
-        - ``class_object_count``  -- DP02 valid instance count (M_valid)
-        - ``class_object_ratio``  -- DP02 valid ratio: class_object_count / M_valid
-        - ``class_image_count``   -- DP03 valid unique image count
-        - ``class_image_ratio``   -- DP03 valid prevalence: class_image_count / N
-        - ``status``              -- "available" or "not_available"
     """
     total_objects = len(objects)
     n = len(images) if images is not None else None
+
+    images_by_key = {img.image_key: img for img in images} if images is not None else {}
+    images_by_id: dict[str, list[ImageRecord]] = {}
+    if images is not None:
+        for img in images:
+            images_by_id.setdefault(img.image_id, []).append(img)
 
     # Resolve valid_objects for DP02/DP03 profiling metrics
     if valid_objects is not None:
         effective_valid = valid_objects
     elif images is not None:
-        images_by_id = {img.image_id: img for img in images}
-        effective_valid = [
-            obj for obj in objects
-            if obj.image_id in images_by_id and validate_bbox(
-                obj,
-                image_width=images_by_id[obj.image_id].width,
-                image_height=images_by_id[obj.image_id].height,
-            ).valid
-        ]
+        effective_valid = []
+        for obj in objects:
+            resolved_key = resolve_obj_image_key(obj, images_by_key, images_by_id)
+            if resolved_key in images_by_key:
+                parent_img = images_by_key[resolved_key]
+                if validate_bbox(
+                    obj,
+                    image_width=parent_img.width,
+                    image_height=parent_img.height,
+                ).valid:
+                    effective_valid.append(obj)
     else:
-        # Without images, filter objects that violate intrinsic geometry
-        # (non-finite, reversed x/y, zero/negative dimensions, negative coords)
         effective_valid = [
             obj for obj in objects
             if math.isfinite(obj.x_min)
@@ -301,14 +319,16 @@ def class_distribution(
     legacy_image_sets: dict[str, set[str]] = {}
     for obj in objects:
         legacy_counts[obj.class_name] += 1
-        legacy_image_sets.setdefault(obj.class_name, set()).add(obj.image_id)
+        key = resolve_obj_image_key(obj, images_by_key, images_by_id) if images else obj.image_id
+        legacy_image_sets.setdefault(obj.class_name, set()).add(key)
 
     # Profiling counts over valid objects (M_valid)
     valid_counts: Counter[str] = Counter()
     valid_image_sets: dict[str, set[str]] = {}
     for obj in effective_valid:
         valid_counts[obj.class_name] += 1
-        valid_image_sets.setdefault(obj.class_name, set()).add(obj.image_id)
+        key = resolve_obj_image_key(obj, images_by_key, images_by_id) if images else obj.image_id
+        valid_image_sets.setdefault(obj.class_name, set()).add(key)
 
     result: list[dict[str, Any]] = []
     for class_name, obj_count in legacy_counts.most_common():
@@ -324,7 +344,7 @@ def class_distribution(
             # Legacy fields over M (preserving backward compatibility)
             "object_count": obj_count,
             "image_count": img_count,
-            "percentage": (obj_count / total_objects * 100.0) if total_objects > 0 else 0.0,
+            "percentage": (obj_count / total_objects * 100.0) if total_objects > 0 else None,
             # DP02 fields over M_valid
             "class_object_count": valid_obj_count,
             "class_object_ratio": dp02_ratio,
@@ -338,7 +358,88 @@ def class_distribution(
 
 
 # ---------------------------------------------------------------------------
-# 3. Time-of-day distribution
+# 5. DP04 — Attribute Distribution
+# ---------------------------------------------------------------------------
+
+
+def dp04_attribute_distribution(
+    images: list[ImageRecord],
+    field_name: str,
+) -> dict[str, Any]:
+    """DP04 — Attribute Distribution(f, v).
+
+    Calculates proportion of images having each value v over N,
+    and proportion over known values.
+    Also provides 4-state taxonomy breakdown (known, unknown, missing, invalid).
+
+    If N == 0: returns not_available with reason.
+    """
+    n = len(images)
+    if n == 0:
+        return {
+            "metric_id": "DP04",
+            "field": field_name,
+            "total_images": 0,
+            "status": "not_available",
+            "reason": "Empty dataset (N=0)",
+            "state_counts": {
+                "known": 0,
+                "unknown": 0,
+                "missing": 0,
+                "invalid": 0,
+            },
+            "state_ratios": {
+                "known": None,
+                "unknown": None,
+                "missing": None,
+                "invalid": None,
+            },
+            "value_counts": {},
+            "value_ratios_over_total": {},
+            "value_ratios_over_known": {},
+        }
+
+    state_counts = {
+        "known": 0,
+        "unknown": 0,
+        "missing": 0,
+        "invalid": 0,
+    }
+    value_counts: dict[str, int] = {}
+    known_value_counts: dict[str, int] = {}
+
+    for img in images:
+        res = classify_field(img, field_name)
+        state_key = res.state.value
+        state_counts[state_key] = state_counts.get(state_key, 0) + 1
+
+        val_key = res.value if res.value is not None else "missing"
+        value_counts[val_key] = value_counts.get(val_key, 0) + 1
+
+        if res.state == MetadataState.KNOWN and res.value is not None:
+            known_value_counts[res.value] = known_value_counts.get(res.value, 0) + 1
+
+    known_total = state_counts["known"]
+
+    return {
+        "metric_id": "DP04",
+        "field": field_name,
+        "total_images": n,
+        "status": "available",
+        "reason": None,
+        "state_counts": state_counts,
+        "state_ratios": {k: v / n for k, v in state_counts.items()},
+        "value_counts": value_counts,
+        "value_ratios_over_total": {k: v / n for k, v in value_counts.items()},
+        "value_ratios_over_known": {
+            k: (v / known_total) if known_total > 0 else None
+            for k, v in known_value_counts.items()
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. Time-of-day & Weather distributions (Legacy & Dashboard building blocks)
 # ---------------------------------------------------------------------------
 
 def timeofday_distribution(
@@ -346,13 +447,7 @@ def timeofday_distribution(
 ) -> dict[str, int]:
     """Image-level distribution of the ``timeofday`` metadata field.
 
-    Returns a dict with keys:
-    - ``day``, ``night``, ``dawn_dusk``, ``unknown`` -- counts of images
-      whose ``timeofday`` field equals that value.
-    - ``missing`` -- count of images where ``timeofday is None``
-      (metadata tag absent).
-
-    ``unknown`` and ``missing`` are intentionally kept separate.
+    Returns counts for day, night, dawn_dusk, unknown, missing.
     """
     counts: dict[str, int] = {
         "day": 0,
@@ -363,30 +458,25 @@ def timeofday_distribution(
     }
 
     for img in images:
-        if img.timeofday is None:
+        res = classify_field(img, "timeofday")
+        if res.state == MetadataState.MISSING:
             counts["missing"] += 1
+        elif res.state == MetadataState.UNKNOWN:
+            counts["unknown"] += 1
+        elif res.state == MetadataState.KNOWN and res.value:
+            counts[res.value] = counts.get(res.value, 0) + 1
         else:
-            counts[img.timeofday] = counts.get(img.timeofday, 0) + 1
+            counts["invalid"] = counts.get("invalid", 0) + 1
 
     return counts
 
-
-# ---------------------------------------------------------------------------
-# 4. Weather distribution
-# ---------------------------------------------------------------------------
 
 def weather_distribution(
     images: list[ImageRecord],
 ) -> dict[str, int]:
     """Image-level distribution of the ``weather`` metadata field.
 
-    Returns a dict with keys:
-    - ``clear``, ``rain``, ``fog``, ``overcast``, ``unknown`` -- counts of
-      images whose ``weather`` field equals that value.
-    - ``missing`` -- count of images where ``weather is None``
-      (metadata tag absent).
-
-    ``unknown`` and ``missing`` are intentionally kept separate.
+    Returns counts for clear, rain, fog, overcast, unknown, missing.
     """
     counts: dict[str, int] = {
         "clear": 0,
@@ -398,37 +488,30 @@ def weather_distribution(
     }
 
     for img in images:
-        if img.weather is None:
+        res = classify_field(img, "weather")
+        if res.state == MetadataState.MISSING:
             counts["missing"] += 1
+        elif res.state == MetadataState.UNKNOWN:
+            counts["unknown"] += 1
+        elif res.state == MetadataState.KNOWN and res.value:
+            counts[res.value] = counts.get(res.value, 0) + 1
         else:
-            counts[img.weather] = counts.get(img.weather, 0) + 1
+            counts["invalid"] = counts.get("invalid", 0) + 1
 
     return counts
 
 
-# ---------------------------------------------------------------------------
-# 5. Class-image distribution
-# ---------------------------------------------------------------------------
-
 def class_image_distribution(
     objects: list[ObjectRecord],
 ) -> list[dict[str, Any]]:
-    """Per-class object count and image count, for dashboard reuse.
-
-    Returns a list of dicts, each containing:
-    - ``class_name``
-    - ``object_count``  -- total bounding boxes of this class
-    - ``image_count``   -- unique images containing this class
-
-    Similar to ``class_distribution`` but without the percentage field,
-    providing a reusable building block for different dashboard views.
-    """
+    """Per-class object count and image count, for dashboard reuse."""
     object_counts: Counter[str] = Counter()
     image_sets: dict[str, set[str]] = {}
 
     for obj in objects:
         object_counts[obj.class_name] += 1
-        image_sets.setdefault(obj.class_name, set()).add(obj.image_id)
+        img_identifier = getattr(obj, "image_key", obj.image_id)
+        image_sets.setdefault(obj.class_name, set()).add(img_identifier)
 
     result: list[dict[str, Any]] = []
     for class_name, obj_count in object_counts.most_common():
@@ -439,3 +522,249 @@ def class_image_distribution(
         })
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 7. Data Quality Metrics: DQ02, DQ03, DQ04, DQ05
+# ---------------------------------------------------------------------------
+
+def dq02_metadata_missing_rate(
+    images: list[ImageRecord],
+    field_name: str,
+) -> dict[str, Any]:
+    """DQ02 — Metadata Missing Rate(f).
+
+    Formula: count(image missing field f) / N.
+    Denominator: N. If N == 0: value=None, status="not_available".
+    """
+    n = len(images)
+    if n == 0:
+        return {
+            "metric_id": "DQ02",
+            "scope": "dataset",
+            "field": field_name,
+            "unit": "image",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "Empty dataset (N=0)",
+        }
+
+    missing_count = sum(
+        1 for img in images
+        if classify_field(img, field_name).state == MetadataState.MISSING
+    )
+    return {
+        "metric_id": "DQ02",
+        "scope": "dataset",
+        "field": field_name,
+        "unit": "image",
+        "numerator": missing_count,
+        "denominator": n,
+        "value": missing_count / n,
+        "status": "available",
+        "reason": None,
+    }
+
+
+def dq03_unknown_metadata_rate(
+    images: list[ImageRecord],
+    field_name: str,
+) -> dict[str, Any]:
+    """DQ03 — Unknown Metadata Rate(f).
+
+    Formula: count(image with unknown at field f) / N.
+    Denominator: N. If N == 0: value=None, status="not_available".
+    """
+    n = len(images)
+    if n == 0:
+        return {
+            "metric_id": "DQ03",
+            "scope": "dataset",
+            "field": field_name,
+            "unit": "image",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "Empty dataset (N=0)",
+        }
+
+    unknown_count = sum(
+        1 for img in images
+        if classify_field(img, field_name).state == MetadataState.UNKNOWN
+    )
+    return {
+        "metric_id": "DQ03",
+        "scope": "dataset",
+        "field": field_name,
+        "unit": "image",
+        "numerator": unknown_count,
+        "denominator": n,
+        "value": unknown_count / n,
+        "status": "available",
+        "reason": None,
+    }
+
+
+def dq04_invalid_metadata_rate(
+    images: list[ImageRecord],
+    field_name: str,
+) -> dict[str, Any]:
+    """DQ04 — Invalid Metadata Rate(f).
+
+    Formula: count(image with value outside schema at field f) / N.
+    Denominator: N. If N == 0: value=None, status="not_available".
+    """
+    n = len(images)
+    if n == 0:
+        return {
+            "metric_id": "DQ04",
+            "scope": "dataset",
+            "field": field_name,
+            "unit": "image",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "Empty dataset (N=0)",
+        }
+
+    invalid_count = sum(
+        1 for img in images
+        if classify_field(img, field_name).state == MetadataState.INVALID
+    )
+    return {
+        "metric_id": "DQ04",
+        "scope": "dataset",
+        "field": field_name,
+        "unit": "image",
+        "numerator": invalid_count,
+        "denominator": n,
+        "value": invalid_count / n,
+        "status": "available",
+        "reason": None,
+    }
+
+
+def dq05_known_metadata_rate(
+    images: list[ImageRecord],
+    field_name: str,
+) -> dict[str, Any]:
+    """DQ05 — Known Metadata Rate(f).
+
+    Formula: count(image with valid and determined value at field f) / N.
+    Denominator: N. If N == 0: value=None, status="not_available".
+
+    Constraint: DQ02 + DQ03 + DQ04 + DQ05 = 100% when N > 0.
+    """
+    n = len(images)
+    if n == 0:
+        return {
+            "metric_id": "DQ05",
+            "scope": "dataset",
+            "field": field_name,
+            "unit": "image",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "Empty dataset (N=0)",
+        }
+
+    known_count = sum(
+        1 for img in images
+        if classify_field(img, field_name).state == MetadataState.KNOWN
+    )
+    return {
+        "metric_id": "DQ05",
+        "scope": "dataset",
+        "field": field_name,
+        "unit": "image",
+        "numerator": known_count,
+        "denominator": n,
+        "value": known_count / n,
+        "status": "available",
+        "reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. Data Quality Metric: DQ06
+# ---------------------------------------------------------------------------
+
+def dq06_invalid_bbox_rate(
+    total_objects: list[ObjectRecord] | int,
+    invalid_objects: list[Any] | int,
+) -> dict[str, Any]:
+    """DQ06 — BBox Invalid Rate.
+
+    Formula: count(bbox violating at least one geometric rule) / M.
+    A bounding box violating multiple rules counts only ONCE in the numerator.
+    Denominator: M. If M == 0: value=None, status="not_available", reason="No bounding boxes (M=0)".
+    Never report 0% as if the metric were measured when M=0.
+    """
+    m = len(total_objects) if isinstance(total_objects, list) else total_objects
+    inv_count = len(invalid_objects) if isinstance(invalid_objects, list) else invalid_objects
+
+    if m <= 0:
+        return {
+            "metric_id": "DQ06",
+            "scope": "dataset",
+            "unit": "object",
+            "numerator": inv_count,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "No bounding boxes (M=0)",
+        }
+
+    return {
+        "metric_id": "DQ06",
+        "scope": "dataset",
+        "unit": "object",
+        "numerator": inv_count,
+        "denominator": m,
+        "value": inv_count / m,
+        "status": "available",
+        "reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 9. Data Quality Metric: DQ09
+# ---------------------------------------------------------------------------
+
+def dq09_scene_tag_conflict_rate(
+    images: list[ImageRecord],
+) -> dict[str, Any]:
+    """DQ09 — Scene Tag Conflict Rate.
+
+    Formula: count(images with conflicting scene_info tags) / N.
+    Denominator: N. If N == 0: value=None, status="not_available", reason="Empty dataset (N=0)".
+    """
+    n = len(images)
+    if n == 0:
+        return {
+            "metric_id": "DQ09",
+            "scope": "dataset",
+            "unit": "image",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "Empty dataset (N=0)",
+        }
+
+    conflict_count = sum(1 for img in images if img.has_scene_conflict)
+    return {
+        "metric_id": "DQ09",
+        "scope": "dataset",
+        "unit": "image",
+        "numerator": conflict_count,
+        "denominator": n,
+        "value": conflict_count / n,
+        "status": "available",
+        "reason": None,
+    }
