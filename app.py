@@ -30,7 +30,7 @@ def main() -> None:
     # Step 2: Render overview dashboard if parsing succeeded
     if result is not None:
         st.divider()
-        render_overview(images=result.images, objects=result.objects)
+        render_overview(images=result.images, valid_objects=result.valid_objects)
     else:
         st.info("👆 Vui lòng tải lên file ZIP export từ CVAT để bắt đầu phân tích dữ liệu.")
 

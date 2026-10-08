@@ -18,7 +18,8 @@ from core.statistics import (
 
 def render_overview(
     images: list[ImageRecord],
-    objects: list[ObjectRecord],
+    valid_objects: list[ObjectRecord] | None = None,
+    objects: list[ObjectRecord] | None = None,
 ) -> None:
     """Render high-level dataset metrics and attribute distributions.
 
@@ -26,14 +27,18 @@ def render_overview(
     ----------
     images : list[ImageRecord]
         List of parsed image records.
-    objects : list[ObjectRecord]
-        List of parsed object records.
+    valid_objects : list[ObjectRecord] | None
+        List of valid object records (M_valid).
+    objects : list[ObjectRecord] | None
+        Legacy alias for valid_objects.
     """
+    target_objects = valid_objects if valid_objects is not None else (objects or [])
+
     # -----------------------------------------------------------------------
     # A. Dataset Summary
     # -----------------------------------------------------------------------
     st.subheader("1. Tổng quan Dataset (Dataset Summary)")
-    summary = dataset_summary(images, objects)
+    summary = dataset_summary(images, target_objects)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Tổng số ảnh", summary["total_images"])
@@ -48,7 +53,7 @@ def render_overview(
     # B. Class Distribution
     # -----------------------------------------------------------------------
     st.subheader("2. Phân bố Class (Class Distribution)")
-    class_dist = class_distribution(objects)
+    class_dist = class_distribution(target_objects)
 
     if class_dist:
         df_class = pd.DataFrame(class_dist)
@@ -146,7 +151,7 @@ def render_overview(
     # E. Class Image Distribution
     # -----------------------------------------------------------------------
     st.subheader("5. Phân bố Class theo Số lượng Ảnh (Class-Image Distribution)")
-    class_img_dist = class_image_distribution(objects)
+    class_img_dist = class_image_distribution(target_objects)
 
     if class_img_dist:
         df_class_img = pd.DataFrame(class_img_dist)
