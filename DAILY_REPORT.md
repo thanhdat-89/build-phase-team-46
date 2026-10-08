@@ -116,4 +116,4 @@
 - Hoàn thành vertical slice đầu tiên từ:
   `CVAT ZIP → Parser → Normalized data → Statistics → Streamlit Dashboard → Docker → Render`.
 - Parser và statistics đã được kiểm thử với test fixtures và dataset CVAT thực tế.
-- Demo đã được deploy thành công trên Render Free để phục vụ kiểm thử và review trong team.
+- Demo đã được deploy thành công trên Render Free để phục vụ kiểm thử và review trong team .
