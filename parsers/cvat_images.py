@@ -1,14 +1,15 @@
+
 """Parser for CVAT Images 1.1 ZIP exports.
 
 Reads a ZIP file containing a single CVAT XML annotation file and
-(optionally) an images/ folder.  Returns lists of ``ImageRecord`` and
-``ObjectRecord`` ready for consumption by ``core.statistics``.
+(optionally) an images/ folder. Returns lists of ImageRecord and
+ObjectRecord ready for consumption by core.statistics.
 
 Security
 --------
-* Uses **defusedxml** to parse XML (mitigates XML bombs / XXE).
-* Reads the XML member directly from the ZIP; never extracts to disk.
-* Does not execute anything from the ZIP.
+- Uses defusedxml to parse XML (mitigates XML bombs / XXE).
+- Reads the XML member directly from the ZIP; never extracts to disk.
+- Does not execute anything from the ZIP.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from core.validation import (
 )
 
 
-# ── Exceptions ─────────────────────────────────────────────────────────
+# Exceptions
 
 
 class CvatParseError(Exception):
@@ -62,7 +63,7 @@ class CvatInvalidValueError(CvatParseError):
     """A numeric attribute has an invalid (non-numeric) value."""
 
 
-# ── Result container ───────────────────────────────────────────────────
+# Result container
 
 
 @dataclass
@@ -72,7 +73,7 @@ class CvatParseResult:
     Attributes
     ----------
     images : list[ImageRecord]
-        One record per ``<image>`` element in the XML.
+        One record per <image> element in the XML.
     objects : list[ObjectRecord]
         All parsed bounding boxes (M).
     skipped_shapes : dict[str, int]
@@ -90,27 +91,29 @@ class CvatParseResult:
     invalid_objects: list[InvalidObjectRecord] = field(default_factory=list)
 
 
-# ── Shape element names recognised by CVAT but NOT parsed here ─────────
+# Shape element names recognised by CVAT but NOT parsed here.
 
-_UNSUPPORTED_SHAPES = frozenset({
-    "polygon",
-    "polyline",
-    "points",
-    "ellipse",
-    "mask",
-    "cuboid",
-    "skeleton",
-})
+_UNSUPPORTED_SHAPES = frozenset(
+    {
+        "polygon",
+        "polyline",
+        "points",
+        "ellipse",
+        "mask",
+        "cuboid",
+        "skeleton",
+    }
+)
 
 # "box" is the only supported shape.
 # "tag" is image-level metadata, not a shape annotation.
 
 
-# ── Internal helpers ───────────────────────────────────────────────────
+# Internal helpers
 
 
 def _require_attr(element: Any, attr: str, context: str) -> str:
-    """Return the string value of *attr* on *element*, or raise."""
+    """Return the string value of attr on element, or raise."""
     value = element.get(attr)
     if value is None:
         raise CvatMissingAttributeError(
@@ -120,7 +123,7 @@ def _require_attr(element: Any, attr: str, context: str) -> str:
 
 
 def _parse_float(value: str, attr: str, context: str) -> float:
-    """Convert *value* to float or raise with a clear message."""
+    """Convert value to float or raise with a clear message."""
     try:
         return float(value)
     except (ValueError, TypeError) as exc:
@@ -131,7 +134,7 @@ def _parse_float(value: str, attr: str, context: str) -> float:
 
 
 def _parse_int(value: str, attr: str, context: str) -> int:
-    """Convert *value* to int or raise with a clear message."""
+    """Convert value to int or raise with a clear message."""
     try:
         return int(value)
     except (ValueError, TypeError) as exc:
@@ -142,20 +145,20 @@ def _parse_int(value: str, attr: str, context: str) -> int:
 
 
 def _find_single_xml(zf: zipfile.ZipFile) -> str:
-    """Return the member name of the single XML inside *zf*.
+    """Return the member name of the single XML inside zf.
 
     Raises
     ------
     CvatXmlNotFoundError
-        If the ZIP contains no ``.xml`` files.
+        If the ZIP contains no .xml files.
     CvatMultipleXmlError
-        If the ZIP contains more than one ``.xml`` file.
+        If the ZIP contains more than one .xml file.
     """
     xml_names = [
         name
         for name in zf.namelist()
         if PurePosixPath(name).suffix.lower() == ".xml"
-        and not name.startswith("__MACOSX")  # skip macOS resource forks
+        and not name.startswith("__MACOSX")
     ]
 
     if len(xml_names) == 0:
@@ -176,9 +179,9 @@ def _find_single_xml(zf: zipfile.ZipFile) -> str:
 def _extract_all_scene_info(
     image_elem: Any,
 ) -> list[dict[str, str | None]]:
-    """Extract all ``<tag label="scene_info">`` children of *image_elem*.
+    """Extract all scene_info tags from an image element.
 
-    Returns a list of dictionaries with ``"timeofday"`` and ``"weather"`` keys.
+    Returns dictionaries with timeofday and weather keys.
     """
     scene_tags: list[dict[str, str | None]] = []
 
@@ -204,22 +207,22 @@ def _extract_all_scene_info(
 def _extract_scene_info(
     image_elem: Any,
 ) -> tuple[str | None, str | None]:
-    """Extract and validate ``timeofday`` and ``weather`` from scene_info tags.
+    """Extract and validate timeofday and weather from scene_info tags.
 
-    Inspects all scene_info tags for conflicts. If tags conflict, neither value
-    is silently selected and (None, None) is returned.
+    If tags conflict, neither value is silently selected.
     """
     scene_tags = _extract_all_scene_info(image_elem)
-    res = validate_scene_tags(scene_tags)
-    return res.timeofday, res.weather
+    result = validate_scene_tags(scene_tags)
+    return result.timeofday, result.weather
 
 
 def _parse_box(
     box_elem: Any,
     image_id: str,
     box_index: int,
+    dataset_id: str = "default",
 ) -> ObjectRecord:
-    """Parse a single ``<box>`` element into an ``ObjectRecord``."""
+    """Parse a single box element into an ObjectRecord."""
     context = f"<box> #{box_index} in image '{image_id}'"
 
     # Object ID: use the @id attribute if present, else generate one.
@@ -231,15 +234,23 @@ def _parse_box(
 
     class_name = _require_attr(box_elem, "label", context)
 
-    x_min = _parse_float(_require_attr(box_elem, "xtl", context), "xtl", context)
-    y_min = _parse_float(_require_attr(box_elem, "ytl", context), "ytl", context)
-    x_max = _parse_float(_require_attr(box_elem, "xbr", context), "xbr", context)
-    y_max = _parse_float(_require_attr(box_elem, "ybr", context), "ybr", context)
+    x_min = _parse_float(
+        _require_attr(box_elem, "xtl", context), "xtl", context
+    )
+    y_min = _parse_float(
+        _require_attr(box_elem, "ytl", context), "ytl", context
+    )
+    x_max = _parse_float(
+        _require_attr(box_elem, "xbr", context), "xbr", context
+    )
+    y_max = _parse_float(
+        _require_attr(box_elem, "ybr", context), "ybr", context
+    )
 
     occluded_raw = box_elem.get("occluded", "0")
     occluded = occluded_raw == "1"
 
-    # Collect object-level <attribute> children (if any).
+    # Collect object-level attributes.
     attributes: dict[str, str] = {}
     for attr_elem in box_elem.findall("attribute"):
         attr_name = attr_elem.get("name")
@@ -256,10 +267,11 @@ def _parse_box(
         y_max=y_max,
         occluded=occluded,
         attributes=attributes,
+        dataset_id=dataset_id,
     )
 
 
-# ── Public API ─────────────────────────────────────────────────────────
+# Public API
 
 
 def parse_cvat_zip(
@@ -271,29 +283,15 @@ def parse_cvat_zip(
     Parameters
     ----------
     zip_path : str
-        Filesystem path to the ``.zip`` file.
+        Filesystem path to the ZIP file.
     dataset_id : str
-        Identifier assigned to every ``ImageRecord.dataset_id``.
+        Identifier assigned to every ImageRecord and ObjectRecord.
 
     Returns
     -------
     CvatParseResult
-        Contains ``images``, ``objects``, and ``skipped_shapes``.
-
-    Raises
-    ------
-    CvatZipError
-        If *zip_path* is not a valid ZIP.
-    CvatXmlNotFoundError
-        If the ZIP contains no XML files.
-    CvatMultipleXmlError
-        If the ZIP contains multiple XML files.
-    CvatXmlSyntaxError
-        If the XML is malformed.
-    CvatMissingAttributeError
-        If a required attribute is missing from an ``<image>`` or ``<box>``.
-    CvatInvalidValueError
-        If a numeric attribute cannot be parsed.
+        Contains images, objects, skipped_shapes, valid_objects,
+        and invalid_objects.
     """
     # 1. Open the ZIP safely.
     try:
@@ -307,7 +305,7 @@ def parse_cvat_zip(
         # 2. Locate the single XML member.
         xml_member = _find_single_xml(zf)
 
-        # 3. Read & parse the XML.
+        # 3. Read and parse the XML.
         raw_xml = zf.read(xml_member)
 
     try:
@@ -317,7 +315,7 @@ def parse_cvat_zip(
             f"Malformed XML in '{xml_member}': {exc}"
         ) from exc
 
-    # 4. Iterate over <image> elements.
+    # 4. Iterate over image elements.
     images: list[ImageRecord] = []
     objects: list[ObjectRecord] = []
     valid_objects: list[ObjectRecord] = []
@@ -336,7 +334,7 @@ def parse_cvat_zip(
             _require_attr(image_elem, "height", context), "height", context
         )
 
-        # Scene-level metadata with conflict inspection
+        # Extract scene metadata and detect conflicting scene tags.
         scene_tags = _extract_all_scene_info(image_elem)
         scene_result = validate_scene_tags(scene_tags)
 
@@ -358,24 +356,36 @@ def parse_cvat_zip(
         box_index = 0
         for child in image_elem:
             if child.tag == "box":
-                box_record = _parse_box(child, image_id, box_index)
+                box_record = _parse_box(
+                    child,
+                    image_id,
+                    box_index,
+                    dataset_id=dataset_id,
+                )
                 objects.append(box_record)
 
-                # Validate bounding box geometry
-                v_res = validate_bbox(
-                    box_record, image_width=width, image_height=height
+                # Validate bounding box geometry.
+                validation_result = validate_bbox(
+                    box_record,
+                    image_width=width,
+                    image_height=height,
                 )
-                if v_res.valid:
+                if validation_result.valid:
                     valid_objects.append(box_record)
                 else:
                     invalid_objects.append(
-                        InvalidObjectRecord(object=box_record, reasons=v_res.reasons)
+                        InvalidObjectRecord(
+                            object=box_record,
+                            reasons=validation_result.reasons,
+                        )
                     )
 
                 box_index += 1
+
             elif child.tag == "tag":
-                # Image-level tags (e.g. scene_info) are NOT objects.
+                # Image-level tags such as scene_info are not objects.
                 pass
+
             elif child.tag in _UNSUPPORTED_SHAPES:
                 skipped_shapes[child.tag] = (
                     skipped_shapes.get(child.tag, 0) + 1
