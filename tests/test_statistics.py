@@ -13,6 +13,12 @@ from core.statistics import (
     class_distribution,
     class_image_distribution,
     dataset_summary,
+    dq01_schema_validity_images,
+    dq01_schema_validity_objects,
+    dq01_schema_validity_rate,
+    dq01_schema_validity_tags,
+    dq07_duplicate_record_rate,
+    dq08_audited_error_rate,
     timeofday_distribution,
     weather_distribution,
 )
@@ -431,3 +437,253 @@ class TestClassImageDistribution:
         objects = [_obj("o1", "i1", "car")]
         result = class_image_distribution(objects)
         assert "percentage" not in result[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. DQ01 — Schema Validity Rate Tests (Images, Objects, Tags)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestDQ01SchemaValidityRate:
+    """Tests for DQ01 Schema Validity Rate across Images, Objects, and Tags."""
+
+    def test_images_schema_validity(self):
+        """Images passing all applicable rules vs failing."""
+        img_valid = _img("i1", width=100, height=100, timeofday="day", weather="clear")
+        img_zero_dim = _img("i2", width=0, height=100)
+        img_invalid_weather = _img("i3", width=100, height=100, weather="alien_storm")
+        img_conflict = ImageRecord("ds1", "i4", "4.jpg", 100, 100, has_scene_conflict=True)
+
+        res = dq01_schema_validity_images([img_valid, img_zero_dim, img_invalid_weather, img_conflict])
+        assert res["metric_id"] == "DQ01"
+        assert res["unit"] == "image"
+        assert res["status"] == "available"
+        assert res["denominator"] == 4
+        assert res["numerator"] == 1
+        assert res["value"] == 0.25
+
+    def test_images_zero_denominator(self):
+        """Empty images list returns not_available, never 0%."""
+        res = dq01_schema_validity_images([])
+        assert res["unit"] == "image"
+        assert res["status"] == "not_available"
+        assert res["value"] is None
+        assert res["denominator"] == 0
+
+    def test_objects_schema_validity(self):
+        """Objects passing all geometric rules vs failing."""
+        img = _img("i1", width=100, height=100)
+        obj_valid = _obj("o1", "i1", "car")
+        obj_reversed = ObjectRecord("o2", "i1", "car", 50.0, 10.0, 10.0, 30.0)
+        obj_empty_class = ObjectRecord("o3", "i1", "", 10.0, 10.0, 30.0, 30.0)
+
+        res = dq01_schema_validity_objects([obj_valid, obj_reversed, obj_empty_class], images=[img])
+        assert res["metric_id"] == "DQ01"
+        assert res["unit"] == "object"
+        assert res["status"] == "available"
+        assert res["denominator"] == 3
+        assert res["numerator"] == 1
+        assert res["value"] == 1 / 3
+
+    def test_objects_non_finite_coordinates_invalid(self):
+        """Objects with NaN or Inf coordinates are schema-invalid."""
+        img = _img("i1", width=100, height=100)
+        obj_nan = ObjectRecord("o1", "i1", "car", float("nan"), 10.0, 50.0, 50.0)
+        obj_inf = ObjectRecord("o2", "i1", "car", 10.0, float("inf"), 50.0, 50.0)
+        obj_valid = _obj("o3", "i1", "car")
+
+        res = dq01_schema_validity_objects([obj_nan, obj_inf, obj_valid], images=[img])
+        assert res["denominator"] == 3
+        assert res["numerator"] == 1
+        assert res["value"] == 1 / 3
+
+    def test_objects_zero_denominator(self):
+        """Empty objects list returns not_available, never 0%."""
+        res = dq01_schema_validity_objects([])
+        assert res["unit"] == "object"
+        assert res["status"] == "not_available"
+        assert res["value"] is None
+        assert res["denominator"] == 0
+
+    def test_tags_schema_validity(self):
+        """Tags with valid metadata vs invalid metadata."""
+        tag_valid1 = {"timeofday": "day", "weather": "clear"}
+        tag_valid2 = {"timeofday": "unknown", "weather": "rain"}
+        tag_invalid = {"timeofday": "middle_of_the_night", "weather": "clear"}
+
+        res = dq01_schema_validity_tags([tag_valid1, tag_valid2, tag_invalid])
+        assert res["metric_id"] == "DQ01"
+        assert res["unit"] == "tag"
+        assert res["status"] == "available"
+        assert res["denominator"] == 3
+        assert res["numerator"] == 2
+        assert res["value"] == 2 / 3
+
+    def test_tags_zero_denominator(self):
+        """Empty tags list returns not_available, never 0%."""
+        res = dq01_schema_validity_tags([])
+        assert res["unit"] == "tag"
+        assert res["status"] == "not_available"
+        assert res["value"] is None
+        assert res["denominator"] == 0
+
+    def test_separate_metrics_dispatcher(self):
+        """Top-level dispatcher keeps Images, Objects, and Tags strictly separate."""
+        img = _img("i1", width=100, height=100, timeofday="day")
+        obj = _obj("o1", "i1", "car")
+        tags = [{"timeofday": "day", "weather": "clear"}]
+
+        res = dq01_schema_validity_rate(images=[img], objects=[obj], tags=tags)
+        assert "images" in res
+        assert "objects" in res
+        assert "tags" in res
+        assert res["images"]["unit"] == "image"
+        assert res["objects"]["unit"] == "object"
+        assert res["tags"]["unit"] == "tag"
+        # No combined aggregate rate is invented
+        assert "aggregate" not in res
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 7. DQ07 — Duplicate Record Rate Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestDQ07DuplicateRecordRate:
+    """Tests for DQ07 Duplicate Record Rate."""
+
+    def test_duplicate_by_image_key(self):
+        """Duplicate rate by key = (total - unique) / total."""
+        images = [
+            _img("i1", dataset_id="ds1"),
+            _img("i2", dataset_id="ds1"),
+            _img("i2", dataset_id="ds1"),  # duplicate key ds1:i2
+            _img("i3", dataset_id="ds1"),
+        ]
+        res = dq07_duplicate_record_rate(images, key="image_key", unit="image")
+        assert res["metric_id"] == "DQ07"
+        assert res["key"] == "image_key"
+        assert res["unit"] == "image"
+        assert res["status"] == "available"
+        assert res["denominator"] == 4
+        assert res["duplicate_count"] == 1
+        assert res["unique_count"] == 3
+        assert res["value"] == 0.25
+
+    def test_duplicate_by_object_key(self):
+        """Duplicate rate for objects."""
+        objs = [
+            _obj("o1", "i1"),
+            _obj("o1", "i1"),  # duplicate
+        ]
+        res = dq07_duplicate_record_rate(objs, key="object_key", unit="object")
+        assert res["key"] == "object_key"
+        assert res["denominator"] == 2
+        assert res["duplicate_count"] == 1
+        assert res["value"] == 0.5
+
+    def test_confirmed_duplicate_groups(self):
+        """Duplicate groups from Coding Spec: only confirmed=True groups count."""
+        images = [_img("i1"), _img("i2"), _img("i3"), _img("i4")]
+        groups = [
+            {"group_id": "g1", "image_keys": ["ds1:i1", "ds1:i2"], "confirmed": True},  # 1 redundant
+            {"group_id": "g2", "image_keys": ["ds1:i3", "ds1:i4"], "confirmed": False},  # not confirmed
+        ]
+        res = dq07_duplicate_record_rate(images, duplicate_groups=groups, unit="image")
+        assert res["key"] == "confirmed_duplicate_group"
+        assert res["denominator"] == 4
+        assert res["duplicate_count"] == 1  # only from g1
+        assert res["value"] == 0.25
+
+    def test_confirmed_duplicate_groups_flat_tabular_format(self):
+        """Flat tabular duplicate groups format (image_key, group_id, confirmed) from Coding Spec §2."""
+        images = [_img("i1"), _img("i2"), _img("i3"), _img("i4")]
+        groups_flat = [
+            {"image_key": "ds1:i1", "group_id": "g1", "confirmed": True},
+            {"image_key": "ds1:i2", "group_id": "g1", "confirmed": True},
+            {"image_key": "ds1:i3", "group_id": "g2", "confirmed": False},
+            {"image_key": "ds1:i4", "group_id": "g2", "confirmed": False},
+        ]
+        res = dq07_duplicate_record_rate(images, duplicate_groups=groups_flat, unit="image")
+        assert res["key"] == "confirmed_duplicate_group"
+        assert res["denominator"] == 4
+        assert res["duplicate_count"] == 1
+        assert res["value"] == 0.25
+
+    def test_zero_duplicates_boundary(self):
+        """When all records have distinct keys, duplicate rate is exactly 0.0."""
+        images = [_img("i1"), _img("i2"), _img("i3")]
+        res = dq07_duplicate_record_rate(images, key="image_key", unit="image")
+        assert res["denominator"] == 3
+        assert res["duplicate_count"] == 0
+        assert res["unique_count"] == 3
+        assert res["value"] == 0.0
+
+    def test_zero_denominator_returns_not_available(self):
+        """Empty records list returns not_available, never 0%."""
+        res = dq07_duplicate_record_rate([], key="image_key")
+        assert res["status"] == "not_available"
+        assert res["value"] is None
+        assert res["denominator"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 8. DQ08 — Audited Error Rate Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestDQ08AuditedErrorRate:
+    """Tests for DQ08 Audited Error Rate."""
+
+    def test_absent_review_log_not_available_no_fabrication(self):
+        """When review log is absent (None or empty), returns not_available without fabricating."""
+        res_none = dq08_audited_error_rate(None, unit="image")
+        assert res_none["metric_id"] == "DQ08"
+        assert res_none["unit"] == "image"
+        assert res_none["status"] == "not_available"
+        assert res_none["value"] is None
+        assert res_none["denominator"] == 0
+        assert "No review log available" in res_none["reason"]
+
+        res_empty = dq08_audited_error_rate([], unit="object")
+        assert res_empty["status"] == "not_available"
+        assert res_empty["value"] is None
+
+    def test_unknown_status_does_not_count_as_reviewed(self):
+        """'unknown' status does NOT prove the unit has been reviewed."""
+        log = [
+            {"image_key": "i1", "review_status": "unknown"},
+            {"image_key": "i2", "review_status": "unreviewed"},
+        ]
+        res = dq08_audited_error_rate(log, unit="image")
+        assert res["status"] == "not_available"
+        assert res["value"] is None
+        assert res["reviewed_count"] == 0
+
+    def test_reviewed_units_error_rate_calculation(self):
+        """Calculates confirmed errors / reviewed units."""
+        log = [
+            {"image_key": "i1", "review_status": "verified", "has_error": False},
+            {"image_key": "i2", "review_status": "error", "has_error": True},
+            {"image_key": "i3", "review_status": "approved", "has_error": False},
+            {"image_key": "i4", "review_status": "unknown"},  # not counted
+        ]
+        res = dq08_audited_error_rate(log, unit="image", reviewer="Alice", reference="v1.0")
+        assert res["status"] == "available"
+        assert res["reviewer"] == "Alice"
+        assert res["reference"] == "v1.0"
+        assert res["denominator"] == 3  # i1, i2, i3
+        assert res["numerator"] == 1    # i2
+        assert res["value"] == 1 / 3
+
+    def test_object_unit_error_rate(self):
+        """Supports separate object-level audited error rate."""
+        log = [
+            {"object_key": "o1", "review_status": "label_error"},
+            {"object_key": "o2", "review_status": "verified"},
+        ]
+        res = dq08_audited_error_rate(log, unit="object")
+        assert res["unit"] == "object"
+        assert res["denominator"] == 2
+        assert res["numerator"] == 1
+        assert res["value"] == 0.5

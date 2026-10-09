@@ -12,11 +12,15 @@ import unittest
 
 from core.schema import ImageRecord, ObjectRecord
 from core.statistics import (
+    calculate_bbox_area_ratio,
+    class_distribution,
     dataset_summary,
     dp01_inventory,
     dp02_class_instance_share,
     dp03_class_image_prevalence,
-    class_distribution,
+    dp05_relative_bbox_area,
+    dp06_occlusion_rate,
+    dp07_attribute_availability,
 )
 
 
@@ -359,6 +363,179 @@ class TestClassDistributionEnriched(unittest.TestCase):
         self.assertAlmostEqual(car_exp["class_object_ratio"], 1.0)
         self.assertEqual(car_exp["class_image_count"], 1)
         self.assertAlmostEqual(car_exp["class_image_ratio"], 0.5)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 4. DP05 — Relative BBox Area Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestDP05RelativeBBoxArea(unittest.TestCase):
+    """Test suite for DP05 Relative BBox Area metric."""
+
+    def test_01_single_box_area_ratio_calculation(self):
+        """calculate_bbox_area_ratio computes exact geometric ratio on valid input."""
+        # 32x24 bbox on 640x480 image: (32*24) / (640*480) = 768 / 307200 = 0.0025
+        obj = ObjectRecord("o1", "i1", "car", 10.0, 10.0, 42.0, 34.0)
+        ratio = calculate_bbox_area_ratio(obj, 640, 480)
+        self.assertIsNotNone(ratio)
+        self.assertAlmostEqual(ratio, 0.0025)
+
+    def test_02_invalid_geometry_excluded(self):
+        """Invalid geometry returns None and is excluded from area statistics."""
+        # Reversed x
+        rev_obj = ObjectRecord("o1", "i1", "car", 50.0, 10.0, 10.0, 30.0)
+        self.assertIsNone(calculate_bbox_area_ratio(rev_obj, 640, 480))
+
+        # Out of bounds
+        oob_obj = ObjectRecord("o2", "i1", "car", -5.0, 10.0, 20.0, 30.0)
+        self.assertIsNone(calculate_bbox_area_ratio(oob_obj, 640, 480))
+
+        # Zero width
+        zw_obj = ObjectRecord("o3", "i1", "car", 10.0, 10.0, 10.0, 30.0)
+        self.assertIsNone(calculate_bbox_area_ratio(zw_obj, 640, 480))
+
+    def test_03_invalid_image_dimensions_excluded(self):
+        """Images with non-positive dimensions (w<=0 or h<=0) return None."""
+        obj = ObjectRecord("o1", "i1", "car", 10.0, 10.0, 50.0, 50.0)
+        self.assertIsNone(calculate_bbox_area_ratio(obj, 0, 480))
+        self.assertIsNone(calculate_bbox_area_ratio(obj, 640, -10))
+
+    def test_04_dataset_level_dp05_statistics(self):
+        """dp05_relative_bbox_area calculates correct mean and descriptive statistics."""
+        img1 = ImageRecord("ds1", "i1", "1.jpg", 100, 100)
+        img2 = ImageRecord("ds1", "i2", "2.jpg", 100, 100)
+        # Box 1: 10x10 -> area = 100 / 10000 = 0.01
+        # Box 2: 20x20 -> area = 400 / 10000 = 0.04
+        # Box 3: invalid geometry -> excluded
+        objs = [
+            ObjectRecord("o1", "i1", "car", 0.0, 0.0, 10.0, 10.0),
+            ObjectRecord("o2", "i2", "car", 0.0, 0.0, 20.0, 20.0),
+            ObjectRecord("o3", "i1", "car", 50.0, 0.0, 10.0, 10.0),  # reversed x
+        ]
+        res = dp05_relative_bbox_area([img1, img2], objs)
+        self.assertEqual(res["status"], "available")
+        self.assertEqual(res["denominator"], 2)
+        self.assertEqual(res["excluded_count"], 1)
+        self.assertAlmostEqual(res["value"], 0.025)  # (0.01 + 0.04) / 2
+        self.assertIsNotNone(res["summary"])
+        self.assertAlmostEqual(res["summary"]["min"], 0.01)
+        self.assertAlmostEqual(res["summary"]["max"], 0.04)
+        self.assertAlmostEqual(res["summary"]["mean"], 0.025)
+
+    def test_05_zero_denominator_returns_not_available(self):
+        """When M_valid == 0, DP05 returns not_available, never an invented 0%."""
+        res_empty = dp05_relative_bbox_area([], [])
+        self.assertEqual(res_empty["status"], "not_available")
+        self.assertIsNone(res_empty["value"])
+        self.assertEqual(res_empty["denominator"], 0)
+
+        # Only invalid objects
+        img = ImageRecord("ds1", "i1", "1.jpg", 100, 100)
+        invalid_obj = ObjectRecord("o1", "i1", "car", 50.0, 0.0, 10.0, 10.0)
+        res_inv = dp05_relative_bbox_area([img], [invalid_obj])
+        self.assertEqual(res_inv["status"], "not_available")
+        self.assertIsNone(res_inv["value"])
+        self.assertEqual(res_inv["excluded_count"], 1)
+
+    def test_06_small_bbox_semantics_distance_fallacy_guarded(self):
+        """Small bbox area is treated purely as 2D image-space geometric size."""
+        img = ImageRecord("ds1", "i1", "1.jpg", 1000, 1000)
+        # Small 2x2 bbox: area_ratio = 4 / 1000000 = 0.000004
+        small_obj = ObjectRecord("o1", "i1", "screw", 10.0, 10.0, 12.0, 12.0)
+        res = dp05_relative_bbox_area([img], [small_obj])
+        self.assertEqual(res["status"], "available")
+        self.assertEqual(res["unit"], "object")
+        self.assertAlmostEqual(res["value"], 0.000004)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5. DP06 — Occlusion Rate Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestDP06OcclusionRate(unittest.TestCase):
+    """Test suite for DP06 Occlusion Rate metric."""
+
+    def test_01_normal_dataset_occlusion_rate(self):
+        """Formula: count(occluded=True) / count(valid occluded values)."""
+        objs = [
+            ObjectRecord("o1", "i1", "car", 0, 0, 10, 10, occluded=True),
+            ObjectRecord("o2", "i1", "car", 0, 0, 10, 10, occluded=False),
+            ObjectRecord("o3", "i1", "pedestrian", 0, 0, 10, 10, occluded=True),
+            ObjectRecord("o4", "i1", "pedestrian", 0, 0, 10, 10, occluded=False),
+        ]
+        res = dp06_occlusion_rate(objs)
+        self.assertEqual(res["status"], "available")
+        self.assertEqual(res["numerator"], 2)
+        self.assertEqual(res["denominator"], 4)
+        self.assertAlmostEqual(res["value"], 0.5)
+        self.assertAlmostEqual(res["percentage"], 50.0)
+
+    def test_02_per_class_breakdown(self):
+        """DP06 provides breakdown by class as defined in DP06(c)."""
+        objs = [
+            ObjectRecord("o1", "i1", "car", 0, 0, 10, 10, occluded=True),
+            ObjectRecord("o2", "i1", "car", 0, 0, 10, 10, occluded=True),
+            ObjectRecord("o3", "i1", "pedestrian", 0, 0, 10, 10, occluded=False),
+        ]
+        res = dp06_occlusion_rate(objs)
+        by_class = {c["class_name"]: c for c in res["by_class"]}
+        self.assertAlmostEqual(by_class["car"]["value"], 1.0)
+        self.assertAlmostEqual(by_class["pedestrian"]["value"], 0.0)
+
+        # Filtering to specific class
+        res_car = dp06_occlusion_rate(objs, class_name="car")
+        self.assertEqual(res_car["scope"], "class")
+        self.assertEqual(res_car["class_name"], "car")
+        self.assertAlmostEqual(res_car["value"], 1.0)
+
+    def test_03_zero_denominator_returns_not_available(self):
+        """Zero objects with valid occluded values returns not_available, never 0%."""
+        res = dp06_occlusion_rate([])
+        self.assertEqual(res["status"], "not_available")
+        self.assertIsNone(res["value"])
+        self.assertEqual(res["denominator"], 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. DP07 — Attribute Availability Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestDP07AttributeAvailability(unittest.TestCase):
+    """Test suite for DP07 Attribute Availability metric."""
+
+    def test_01_attribute_availability_exact_unit_and_denominator(self):
+        """Unit is 'object', denominator is objects in scope."""
+        objs = [
+            ObjectRecord("o1", "i1", "car", 0, 0, 10, 10, attributes={"color": "red"}),
+            ObjectRecord("o2", "i1", "car", 0, 0, 10, 10, attributes={"color": "blue"}),
+            ObjectRecord("o3", "i1", "car", 0, 0, 10, 10, attributes={}),
+            ObjectRecord("o4", "i1", "car", 0, 0, 10, 10, attributes={"color": ""}),
+        ]
+        res = dp07_attribute_availability(objs)
+        self.assertEqual(res["unit"], "object")
+        self.assertEqual(res["status"], "available")
+        self.assertEqual(res["denominator"], 4)
+        self.assertEqual(res["numerator"], 2)  # o1 and o2 have non-empty attributes
+        self.assertAlmostEqual(res["value"], 0.5)
+
+    def test_02_specific_attribute_availability(self):
+        """When attribute_name is specified, only that attribute is evaluated."""
+        objs = [
+            ObjectRecord("o1", "i1", "car", 0, 0, 10, 10, attributes={"color": "red"}),
+            ObjectRecord("o2", "i1", "car", 0, 0, 10, 10, attributes={"pose": "standing"}),
+        ]
+        res_color = dp07_attribute_availability(objs, attribute_name="color")
+        self.assertEqual(res_color["numerator"], 1)
+        self.assertEqual(res_color["denominator"], 2)
+        self.assertAlmostEqual(res_color["value"], 0.5)
+
+    def test_03_zero_denominator_returns_not_available(self):
+        """Zero objects in scope returns not_available, never 0%."""
+        res = dp07_attribute_availability([])
+        self.assertEqual(res["unit"], "object")
+        self.assertEqual(res["status"], "not_available")
+        self.assertIsNone(res["value"])
+        self.assertEqual(res["denominator"], 0)
 
 
 if __name__ == "__main__":

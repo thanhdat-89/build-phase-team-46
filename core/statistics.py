@@ -1,4 +1,4 @@
-﻿"""Statistics and metric calculation layer for N2-05B CVAT Dashboard.
+"""Statistics and metric calculation layer for N2-05B CVAT Dashboard.
 
 Implements Data Profiling (DP01-DP04) and Data Quality (DQ02-DQ06, DQ09) metrics
 strictly adhering to Co_so_ly_thuyet_Data_Quality_Coverage_N2-05B.md and
@@ -767,4 +767,741 @@ def dq09_scene_tag_conflict_rate(
         "value": conflict_count / n,
         "status": "available",
         "reason": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helper: Descriptive Statistics (Core tier)
+# ---------------------------------------------------------------------------
+
+def _percentile(sorted_data: list[float], p: float) -> float:
+    """Calculate the p-th percentile (0.0 <= p <= 1.0) of sorted data."""
+    if not sorted_data:
+        return 0.0
+    k = (len(sorted_data) - 1) * p
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_data[int(k)]
+    d0 = sorted_data[int(f)] * (c - k)
+    d1 = sorted_data[int(c)] * (k - f)
+    return d0 + d1
+
+
+def calculate_bbox_area_ratio(
+    obj: ObjectRecord,
+    image_width: int,
+    image_height: int,
+) -> float | None:
+    """Calculate relative bounding box area ratio for a single object.
+
+    Formula: (x_max - x_min) * (y_max - y_min) / (image_width * image_height).
+    Only valid for bounding boxes with valid geometry and positive image dimensions.
+
+    CRITICAL SEMANTICS:
+    A small bbox area_ratio reflects 2D projected size on the image,
+    NOT proof of physical distance in 3D world space.
+    """
+    if image_width <= 0 or image_height <= 0:
+        return None
+    val_res = validate_bbox(obj, image_width=image_width, image_height=image_height)
+    if not val_res.valid:
+        return None
+    return ((obj.x_max - obj.x_min) * (obj.y_max - obj.y_min)) / (image_width * image_height)
+
+
+# ---------------------------------------------------------------------------
+# 10. DP05 — Relative BBox Area
+# ---------------------------------------------------------------------------
+
+def dp05_relative_bbox_area(
+    images: list[ImageRecord],
+    objects: list[ObjectRecord],
+    valid_objects: list[ObjectRecord] | None = None,
+    class_name: str | None = None,
+) -> dict[str, Any]:
+    """DP05 — Relative BBox Area.
+
+    Formula: area_ratio = (x_max - x_min) * (y_max - y_min) / (width * height).
+    Only valid bounding boxes with positive image dimensions are included.
+    Invalid geometry is excluded from area statistics and reported in ``excluded_count``.
+
+    CRITICAL SEMANTICS:
+    A small bounding box area (small area_ratio) is strictly a 2D image-space
+    geometric measurement and MUST NOT be interpreted as proof that an object
+    is far away in 3D physical space.
+
+    Denominator: M_valid (count of valid bounding boxes with valid image dimensions).
+    If denominator == 0: value=None, status="not_available". Never invent 0%.
+    """
+    images_by_key = {img.image_key: img for img in images}
+    images_by_id: dict[str, list[ImageRecord]] = {}
+    for img in images:
+        images_by_id.setdefault(img.image_id, []).append(img)
+
+    valid_obj_set = set(id(o) for o in valid_objects) if valid_objects is not None else None
+
+    target_objects = [o for o in objects if o.class_name == class_name] if class_name is not None else objects
+
+    ratios: list[float] = []
+    excluded_count = 0
+
+    for obj in target_objects:
+        if valid_obj_set is not None and id(obj) not in valid_obj_set:
+            excluded_count += 1
+            continue
+
+        resolved_key = resolve_obj_image_key(obj, images_by_key, images_by_id)
+        parent_img = images_by_key.get(resolved_key)
+        if parent_img is None or parent_img.width <= 0 or parent_img.height <= 0:
+            excluded_count += 1
+            continue
+
+        ratio = calculate_bbox_area_ratio(obj, parent_img.width, parent_img.height)
+        if ratio is None:
+            excluded_count += 1
+            continue
+
+        ratios.append(ratio)
+
+    m_valid = len(ratios)
+    if m_valid == 0:
+        return {
+            "metric_id": "DP05",
+            "scope": "class" if class_name else "dataset",
+            "field": "area_ratio",
+            "class_name": class_name,
+            "unit": "object",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "No valid bounding boxes with positive image dimensions (M_valid=0)",
+            "excluded_count": excluded_count,
+            "summary": None,
+            "area_ratios": [],
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    sorted_ratios = sorted(ratios)
+    mean_val = sum(sorted_ratios) / m_valid
+    median_val = _percentile(sorted_ratios, 0.5)
+    summary = {
+        "count": m_valid,
+        "min": sorted_ratios[0],
+        "max": sorted_ratios[-1],
+        "mean": mean_val,
+        "median": median_val,
+        "p25": _percentile(sorted_ratios, 0.25),
+        "p75": _percentile(sorted_ratios, 0.75),
+    }
+
+    return {
+        "metric_id": "DP05",
+        "scope": "class" if class_name else "dataset",
+        "field": "area_ratio",
+        "class_name": class_name,
+        "unit": "object",
+        "numerator": sum(sorted_ratios),
+        "denominator": m_valid,
+        "value": mean_val,
+        "status": "available",
+        "reason": None,
+        "excluded_count": excluded_count,
+        "summary": summary,
+        "area_ratios": sorted_ratios,
+        "definition_version": "1.0",
+        "config_version": "1",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 11. DP06 — Occlusion Rate
+# ---------------------------------------------------------------------------
+
+def dp06_occlusion_rate(
+    objects: list[ObjectRecord],
+    class_name: str | None = None,
+) -> dict[str, Any]:
+    """DP06 — Occlusion Rate.
+
+    Formula: count(object class c with occluded=True) / count(object class c with valid occluded value).
+    Valid occluded values: boolean (True/False) or integer (1/0).
+    Non-boolean/None occluded values are excluded from the denominator.
+
+    Denominator: count of objects with valid occluded values.
+    If denominator == 0: value=None, status="not_available". Never invent 0%.
+    """
+    def _is_valid_occluded(val: Any) -> bool:
+        return isinstance(val, (bool, int)) and val in (True, False, 1, 0)
+
+    def _is_occluded_true(val: Any) -> bool:
+        return val is True or val == 1
+
+    target_objects = [o for o in objects if o.class_name == class_name] if class_name is not None else objects
+
+    valid_occluded_count = sum(1 for o in target_objects if _is_valid_occluded(o.occluded))
+    occluded_true_count = sum(1 for o in target_objects if _is_valid_occluded(o.occluded) and _is_occluded_true(o.occluded))
+    excluded_count = len(target_objects) - valid_occluded_count
+
+    # Breakdown by class
+    classes = sorted({o.class_name for o in objects})
+    by_class: list[dict[str, Any]] = []
+    for c in classes:
+        c_objs = [o for o in objects if o.class_name == c]
+        c_valid = sum(1 for o in c_objs if _is_valid_occluded(o.occluded))
+        c_occ = sum(1 for o in c_objs if _is_valid_occluded(o.occluded) and _is_occluded_true(o.occluded))
+        c_ratio = (c_occ / c_valid) if c_valid > 0 else None
+        by_class.append({
+            "class_name": c,
+            "numerator": c_occ,
+            "denominator": c_valid,
+            "value": c_ratio,
+            "percentage": (c_ratio * 100.0) if c_ratio is not None else None,
+            "status": "available" if c_valid > 0 else "not_available",
+            "excluded_count": len(c_objs) - c_valid,
+        })
+
+    if valid_occluded_count == 0:
+        return {
+            "metric_id": "DP06",
+            "scope": "class" if class_name else "dataset",
+            "class_name": class_name,
+            "unit": "object",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "percentage": None,
+            "status": "not_available",
+            "reason": "No objects with valid occlusion values (denominator=0)",
+            "excluded_count": excluded_count,
+            "by_class": by_class,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    rate = occluded_true_count / valid_occluded_count
+    return {
+        "metric_id": "DP06",
+        "scope": "class" if class_name else "dataset",
+        "class_name": class_name,
+        "unit": "object",
+        "numerator": occluded_true_count,
+        "denominator": valid_occluded_count,
+        "value": rate,
+        "percentage": rate * 100.0,
+        "status": "available",
+        "reason": None,
+        "excluded_count": excluded_count,
+        "by_class": by_class,
+        "definition_version": "1.0",
+        "config_version": "1",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 12. DP07 — Attribute Availability
+# ---------------------------------------------------------------------------
+
+def dp07_attribute_availability(
+    objects: list[ObjectRecord],
+    attribute_name: str | None = None,
+    class_name: str | None = None,
+) -> dict[str, Any]:
+    """DP07 — Attribute Availability.
+
+    Formula: count(objects with attribute info) / count(objects in scope).
+    Unit: "object".
+    Denominator: count of objects in scope.
+    If denominator == 0: value=None, status="not_available". Never invent 0%.
+    """
+    target_objects = [o for o in objects if o.class_name == class_name] if class_name is not None else objects
+    total_in_scope = len(target_objects)
+
+    if total_in_scope == 0:
+        return {
+            "metric_id": "DP07",
+            "scope": "class" if class_name else "dataset",
+            "class_name": class_name,
+            "attribute_name": attribute_name,
+            "unit": "object",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "percentage": None,
+            "status": "not_available",
+            "reason": "No objects in scope (denominator=0)",
+            "excluded_count": 0,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    def _has_attr_info(obj: ObjectRecord) -> bool:
+        if not getattr(obj, "attributes", None):
+            return False
+        if attribute_name is not None:
+            val = obj.attributes.get(attribute_name)
+            return val is not None and str(val).strip() != ""
+        return any(v is not None and str(v).strip() != "" for v in obj.attributes.values())
+
+    available_count = sum(1 for o in target_objects if _has_attr_info(o))
+    avail_rate = available_count / total_in_scope
+
+    # Discover attribute breakdown if attribute_name is None
+    all_attr_names = sorted({k for o in target_objects for k in getattr(o, "attributes", {})})
+    by_attribute: dict[str, dict[str, Any]] = {}
+    for attr in all_attr_names:
+        c_count = sum(1 for o in target_objects if o.attributes.get(attr) is not None and str(o.attributes.get(attr)).strip() != "")
+        by_attribute[attr] = {
+            "numerator": c_count,
+            "denominator": total_in_scope,
+            "value": c_count / total_in_scope,
+        }
+
+    return {
+        "metric_id": "DP07",
+        "scope": "class" if class_name else "dataset",
+        "class_name": class_name,
+        "attribute_name": attribute_name,
+        "unit": "object",
+        "numerator": available_count,
+        "denominator": total_in_scope,
+        "value": avail_rate,
+        "percentage": avail_rate * 100.0,
+        "status": "available",
+        "reason": None,
+        "excluded_count": 0,
+        "by_attribute": by_attribute,
+        "definition_version": "1.0",
+        "config_version": "1",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 13. DQ01 — Schema Validity Rate (Images, Objects, Tags separately)
+# ---------------------------------------------------------------------------
+
+def dq01_schema_validity_images(
+    images: list[ImageRecord],
+) -> dict[str, Any]:
+    """DQ01 — Schema Validity Rate for Images.
+
+    Formula: count(images passing all applicable schema rules) / N.
+    Unit: "image".
+    Applicable rules:
+    - Positive finite integer width and height
+    - Non-empty image_id and image_path
+    - No scene conflict (has_scene_conflict is False)
+    - Metadata values are not invalid (timeofday, weather != INVALID)
+
+    Denominator: N. If N == 0: value=None, status="not_available". Never invent 0%.
+    """
+    n = len(images)
+    if n == 0:
+        return {
+            "metric_id": "DQ01",
+            "scope": "dataset",
+            "entity_type": "images",
+            "unit": "image",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "Empty dataset (N=0)",
+            "excluded_count": 0,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    def _is_image_valid(img: ImageRecord) -> bool:
+        if not (isinstance(img.width, int) and isinstance(img.height, int) and img.width > 0 and img.height > 0):
+            return False
+        if not (img.image_id and str(img.image_id).strip() and img.image_path and str(img.image_path).strip()):
+            return False
+        if img.has_scene_conflict:
+            return False
+        if classify_field(img, "timeofday").state == MetadataState.INVALID:
+            return False
+        if classify_field(img, "weather").state == MetadataState.INVALID:
+            return False
+        return True
+
+    valid_count = sum(1 for img in images if _is_image_valid(img))
+    rate = valid_count / n
+    return {
+        "metric_id": "DQ01",
+        "scope": "dataset",
+        "entity_type": "images",
+        "unit": "image",
+        "numerator": valid_count,
+        "denominator": n,
+        "value": rate,
+        "percentage": rate * 100.0,
+        "status": "available",
+        "reason": None,
+        "excluded_count": 0,
+        "definition_version": "1.0",
+        "config_version": "1",
+    }
+
+
+def dq01_schema_validity_objects(
+    objects: list[ObjectRecord],
+    images: list[ImageRecord] | None = None,
+) -> dict[str, Any]:
+    """DQ01 — Schema Validity Rate for Objects.
+
+    Formula: count(objects passing all geometric and schema rules) / M.
+    Unit: "object".
+    Applicable rules:
+    - Non-empty object_id and class_name
+    - Finite coordinates
+    - x_max > x_min, y_max > y_min, x_min >= 0, y_min >= 0
+    - If parent image is known: x_max <= image.width, y_max <= image.height
+
+    Denominator: M. If M == 0: value=None, status="not_available". Never invent 0%.
+    """
+    m = len(objects)
+    if m == 0:
+        return {
+            "metric_id": "DQ01",
+            "scope": "dataset",
+            "entity_type": "objects",
+            "unit": "object",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "No objects (M=0)",
+            "excluded_count": 0,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    images_by_key = {img.image_key: img for img in images} if images is not None else {}
+    images_by_id: dict[str, list[ImageRecord]] = {}
+    if images is not None:
+        for img in images:
+            images_by_id.setdefault(img.image_id, []).append(img)
+
+    def _is_object_valid(obj: ObjectRecord) -> bool:
+        if not (obj.object_id and str(obj.object_id).strip() and obj.class_name and str(obj.class_name).strip()):
+            return False
+        if images is not None:
+            resolved_key = resolve_obj_image_key(obj, images_by_key, images_by_id)
+            parent_img = images_by_key.get(resolved_key)
+            if parent_img is not None:
+                return validate_bbox(obj, parent_img.width, parent_img.height).valid
+        coords = (obj.x_min, obj.y_min, obj.x_max, obj.y_max)
+        if not all(isinstance(c, (int, float)) and math.isfinite(c) for c in coords):
+            return False
+        if obj.x_min < 0 or obj.y_min < 0 or obj.x_max <= obj.x_min or obj.y_max <= obj.y_min:
+            return False
+        return True
+
+    valid_count = sum(1 for obj in objects if _is_object_valid(obj))
+    rate = valid_count / m
+    return {
+        "metric_id": "DQ01",
+        "scope": "dataset",
+        "entity_type": "objects",
+        "unit": "object",
+        "numerator": valid_count,
+        "denominator": m,
+        "value": rate,
+        "percentage": rate * 100.0,
+        "status": "available",
+        "reason": None,
+        "excluded_count": 0,
+        "definition_version": "1.0",
+        "config_version": "1",
+    }
+
+
+def dq01_schema_validity_tags(
+    tags: list[dict[str, Any]] | None = None,
+    images: list[ImageRecord] | None = None,
+) -> dict[str, Any]:
+    """DQ01 — Schema Validity Rate for Tags.
+
+    Formula: count(tags passing all applicable schema rules) / count(tags checked).
+    Unit: "tag".
+    Applicable rules:
+    - timeofday attribute (if present) is not invalid in the metadata taxonomy
+    - weather attribute (if present) is not invalid in the metadata taxonomy
+
+    Denominator: count of tags. If count == 0: value=None, status="not_available".
+    """
+    effective_tags: list[dict[str, Any]] = []
+    if tags is not None:
+        effective_tags = list(tags)
+    elif images is not None:
+        for img in images:
+            effective_tags.extend(img.scene_tags)
+
+    total_tags = len(effective_tags)
+    if total_tags == 0:
+        return {
+            "metric_id": "DQ01",
+            "scope": "dataset",
+            "entity_type": "tags",
+            "unit": "tag",
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "No tags to evaluate (denominator=0)",
+            "excluded_count": 0,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    def _is_tag_valid(tag: dict[str, Any]) -> bool:
+        tod = tag.get("timeofday")
+        if tod is not None and str(tod).strip():
+            if validate_timeofday(tod).state == MetadataState.INVALID:
+                return False
+        wth = tag.get("weather")
+        if wth is not None and str(wth).strip():
+            if validate_weather(wth).state == MetadataState.INVALID:
+                return False
+        return True
+
+    valid_count = sum(1 for t in effective_tags if _is_tag_valid(t))
+    rate = valid_count / total_tags
+    return {
+        "metric_id": "DQ01",
+        "scope": "dataset",
+        "entity_type": "tags",
+        "unit": "tag",
+        "numerator": valid_count,
+        "denominator": total_tags,
+        "value": rate,
+        "percentage": rate * 100.0,
+        "status": "available",
+        "reason": None,
+        "excluded_count": 0,
+        "definition_version": "1.0",
+        "config_version": "1",
+    }
+
+
+def dq01_schema_validity_rate(
+    images: list[ImageRecord] | None = None,
+    objects: list[ObjectRecord] | None = None,
+    tags: list[dict[str, Any]] | None = None,
+    entity_type: str | None = None,
+) -> dict[str, Any]:
+    """DQ01 — Schema Validity Rate dispatcher.
+
+    Calculates separate schema validity rates for Images, Objects, and Tags.
+    Does NOT combine different denominators into an aggregate rate.
+    """
+    if entity_type == "images":
+        return dq01_schema_validity_images(images or [])
+    if entity_type == "objects":
+        return dq01_schema_validity_objects(objects or [], images)
+    if entity_type == "tags":
+        return dq01_schema_validity_tags(tags, images)
+
+    return {
+        "images": dq01_schema_validity_images(images or []),
+        "objects": dq01_schema_validity_objects(objects or [], images),
+        "tags": dq01_schema_validity_tags(tags, images),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 14. DQ07 — Duplicate Record Rate
+# ---------------------------------------------------------------------------
+
+def dq07_duplicate_record_rate(
+    records: list[Any],
+    key: str | callable = "image_key",
+    unit: str = "record",
+    duplicate_groups: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """DQ07 — Duplicate Record Rate.
+
+    Formula: (total_records - unique_records_by_key) / total_records.
+    Công bố khóa; tọa độ giống nhau chỉ là nghi trùng nếu chưa xác nhận.
+
+    Denominator: count of records.
+    If denominator == 0: value=None, status="not_available". Never invent 0%.
+    """
+    total_records = len(records)
+    key_str = key if isinstance(key, str) else getattr(key, "__name__", "custom_key")
+
+    if total_records == 0:
+        return {
+            "metric_id": "DQ07",
+            "scope": "dataset",
+            "key": key_str,
+            "unit": unit,
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "No records to evaluate (denominator=0)",
+            "duplicate_count": 0,
+            "unique_count": 0,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    if duplicate_groups is not None:
+        # Support both flat tabular records (image_key, group_id, confirmed) from Coding Spec §2
+        # and pre-aggregated group dicts (group_id, image_keys, confirmed)
+        is_flat = any("image_key" in g and "image_keys" not in g for g in duplicate_groups)
+        if is_flat:
+            confirmed_groups_by_id: dict[str, list[str]] = {}
+            for row in duplicate_groups:
+                if row.get("confirmed") in (True, 1):
+                    gid = str(row.get("group_id", "default"))
+                    img_k = row.get("image_key")
+                    if img_k is not None:
+                        confirmed_groups_by_id.setdefault(gid, []).append(str(img_k))
+            redundant_count = sum(max(0, len(keys) - 1) for keys in confirmed_groups_by_id.values())
+        else:
+            confirmed_groups = [g for g in duplicate_groups if g.get("confirmed") in (True, 1)]
+            redundant_count = sum(max(0, len(g.get("image_keys", [])) - 1) for g in confirmed_groups)
+        rate = redundant_count / total_records
+        return {
+            "metric_id": "DQ07",
+            "scope": "dataset",
+            "key": "confirmed_duplicate_group",
+            "unit": unit,
+            "numerator": redundant_count,
+            "denominator": total_records,
+            "value": rate,
+            "status": "available",
+            "reason": None,
+            "duplicate_count": redundant_count,
+            "unique_count": total_records - redundant_count,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    extracted_keys: list[Any] = []
+    for r in records:
+        if callable(key):
+            extracted_keys.append(key(r))
+        elif isinstance(r, dict):
+            extracted_keys.append(r.get(key))
+        else:
+            extracted_keys.append(getattr(r, key, None))
+
+    unique_count = len(set(extracted_keys))
+    duplicate_count = total_records - unique_count
+    rate = duplicate_count / total_records
+
+    return {
+        "metric_id": "DQ07",
+        "scope": "dataset",
+        "key": key_str,
+        "unit": unit,
+        "numerator": duplicate_count,
+        "denominator": total_records,
+        "value": rate,
+        "status": "available",
+        "reason": None,
+        "duplicate_count": duplicate_count,
+        "unique_count": unique_count,
+        "definition_version": "1.0",
+        "config_version": "1",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 15. DQ08 — Audited Error Rate
+# ---------------------------------------------------------------------------
+
+def dq08_audited_error_rate(
+    review_log: list[dict[str, Any]] | None = None,
+    unit: str = "image",
+    reviewer: str | None = None,
+    reference: str | None = None,
+) -> dict[str, Any]:
+    """DQ08 — Audited Error Rate.
+
+    Formula: confirmed_error_units / reviewed_units.
+    Tách ảnh và object; cần reviewer/reference.
+
+    CRITICAL SEMANTICS:
+    - NEVER fabricate review-log data. When review log is absent (None or empty),
+      returns value=None, status="not_available" with explicit reason.
+    - An 'unknown' review status does NOT prove the unit has been reviewed.
+    - Zero denominator must produce None / not_available, never 0%.
+    """
+    if review_log is None or len(review_log) == 0:
+        return {
+            "metric_id": "DQ08",
+            "scope": "dataset",
+            "unit": unit,
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "No review log available (review data absent)",
+            "reviewer": reviewer,
+            "reference": reference,
+            "reviewed_count": 0,
+            "error_count": 0,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    reviewed_entries: list[dict[str, Any]] = []
+    for entry in review_log:
+        status = str(entry.get("review_status", "")).lower().strip()
+        if status in ("unknown", "unreviewed", "pending", ""):
+            continue
+        reviewed_entries.append(entry)
+
+    reviewed_count = len(reviewed_entries)
+    if reviewed_count == 0:
+        return {
+            "metric_id": "DQ08",
+            "scope": "dataset",
+            "unit": unit,
+            "numerator": 0,
+            "denominator": 0,
+            "value": None,
+            "status": "not_available",
+            "reason": "No reviewed units in review log (denominator=0)",
+            "reviewer": reviewer,
+            "reference": reference,
+            "reviewed_count": 0,
+            "error_count": 0,
+            "definition_version": "1.0",
+            "config_version": "1",
+        }
+
+    def _is_error(entry: dict[str, Any]) -> bool:
+        if entry.get("has_error") is True or entry.get("confirmed_error") is True:
+            return True
+        status = str(entry.get("review_status", "")).lower().strip()
+        if status in ("error", "rejected", "label_error", "metadata_error"):
+            return True
+        return False
+
+    error_count = sum(1 for e in reviewed_entries if _is_error(e))
+    rate = error_count / reviewed_count
+
+    return {
+        "metric_id": "DQ08",
+        "scope": "dataset",
+        "unit": unit,
+        "numerator": error_count,
+        "denominator": reviewed_count,
+        "value": rate,
+        "status": "available",
+        "reason": None,
+        "reviewer": reviewer,
+        "reference": reference,
+        "reviewed_count": reviewed_count,
+        "error_count": error_count,
+        "definition_version": "1.0",
+        "config_version": "1",
     }
