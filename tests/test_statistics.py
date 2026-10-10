@@ -687,3 +687,149 @@ class TestDQ08AuditedErrorRate:
         assert res["denominator"] == 2
         assert res["numerator"] == 1
         assert res["value"] == 0.5
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_duplicate_groups_ignore_out_of_scope_members(flat):
+    images = [_img("i1"), _img("i2")]
+    members = ["other:1", "other:2", "other:3", "other:4"]
+    groups = ([{"group_id": "g", "image_key": m, "confirmed": True} for m in members]
+              if flat else [{"group_id": "g", "image_keys": members, "confirmed": True}])
+    result = dq07_duplicate_record_rate(images, duplicate_groups=groups, unit="image")
+    assert result["value"] == 0.0 and result["denominator"] == 2
+    assert result["duplicate_count"] == 0 and result["unique_count"] == 2
+    assert "outside measurement scope" in result["reason"]
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_duplicate_group_repeated_members_count_once(flat):
+    import copy
+    images = [_img("i1"), _img("i2"), _img("i3")]
+    members = ["ds1:i1", "ds1:i1", "ds1:i2", "ds1:i2", "outside:x"]
+    groups = ([{"group_id": "g", "image_key": m, "confirmed": True} for m in members]
+              if flat else [{"group_id": "g", "image_keys": members, "confirmed": True}])
+    original = copy.deepcopy((images, groups))
+    result = dq07_duplicate_record_rate(images, duplicate_groups=groups, unit="image")
+    assert result["duplicate_count"] == 1 and result["unique_count"] == 2
+    assert result["value"] == 1 / 3
+    assert (images, groups) == original
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_overlapping_duplicate_groups_unavailable(flat):
+    images = [_img("i1"), _img("i2"), _img("i3")]
+    groups = [{"group_id": "a", "image_keys": ["ds1:i1", "ds1:i2"], "confirmed": True},
+              {"group_id": "b", "image_keys": ["ds1:i2", "ds1:i3"], "confirmed": True}]
+    if flat:
+        groups = [{"group_id": g["group_id"], "image_key": m, "confirmed": True}
+                  for g in groups for m in g["image_keys"]]
+    for ordered in (groups, list(reversed(groups))):
+        result = dq07_duplicate_record_rate(images, duplicate_groups=ordered, unit="image")
+        assert result["status"] == "not_available" and result["value"] is None
+        assert result["duplicate_count"] is None and result["unique_count"] is None
+        assert "Overlapping" in result["reason"]
+
+
+def test_overlap_only_outside_scope_does_not_block_measurement():
+    result = dq07_duplicate_record_rate([_img("i1"), _img("i2")], duplicate_groups=[
+        {"group_id": "a", "image_keys": ["ds1:i1", "outside:x"], "confirmed": True},
+        {"group_id": "b", "image_keys": ["ds1:i2", "outside:x"], "confirmed": True}])
+    assert result["status"] == "available" and result["value"] == 0.0
+
+
+@pytest.mark.parametrize("group", [None, {"confirmed": True, "image_keys": "ds1:i1"}, {"confirmed": True, "image_keys": [None]}])
+def test_malformed_confirmed_group_is_unavailable(group):
+    result = dq07_duplicate_record_rate([_img("i1")], duplicate_groups=[group])
+    assert result["status"] == "not_available" and result["value"] is None
+    assert result["reason"]
+
+
+def test_audit_mixed_units_are_measured_separately():
+    import copy
+    log = [{"image_key": "ds:i1", "review_status": "verified"},
+           {"image_key": "ds:i1", "object_key": "ds:o1", "review_status": "label_error"}]
+    original = copy.deepcopy(log)
+    image = dq08_audited_error_rate(log, unit="image")
+    obj = dq08_audited_error_rate(log, unit="object")
+    assert image["reviewed_count"] == 1 and image["error_count"] == 0 and image["value"] == 0.0
+    assert obj["reviewed_count"] == 1 and obj["error_count"] == 1 and obj["value"] == 1.0
+    assert log == original
+
+
+@pytest.mark.parametrize("status", ["typo", "unknown", "pending", "unreviewed", "", None])
+def test_invalid_audit_status_never_creates_measured_zero(status):
+    result = dq08_audited_error_rate([{"image_key": "i1", "review_status": status, "has_error": True}])
+    assert result["status"] == "not_available" and result["value"] is None
+    assert result["denominator"] == result["reviewed_count"] == 0
+    assert result["reason"]
+
+
+@pytest.mark.parametrize("unit,key", [("image", "image_key"), ("object", "object_key")])
+def test_audit_unique_units_and_repeated_confirmed_errors(unit, key):
+    log = [{key: "a", "review_status": "verified"}, {key: "a", "review_status": "approved"},
+           {key: "b", "review_status": "error"}, {key: "b", "review_status": "label_error"},
+           {key: "c", "review_status": "typo"}]
+    for ordered in (log, list(reversed(log))):
+        result = dq08_audited_error_rate(ordered, unit=unit, reviewer="Reviewer", reference="v1")
+        assert result["denominator"] == result["reviewed_count"] == 2
+        assert result["numerator"] == result["error_count"] == 1
+        assert result["value"] == 0.5 and result["status"] == "available"
+        assert result["reviewer"] == "Reviewer" and result["reference"] == "v1"
+
+
+def test_audit_missing_unit_identity_is_unavailable():
+    result = dq08_audited_error_rate([{"review_status": "verified"}])
+    assert result["status"] == "not_available" and result["value"] is None
+
+
+@pytest.mark.parametrize("unit,key", [("image", "image_key"), ("object", "object_key")])
+@pytest.mark.parametrize("remaining", [False, True])
+def test_contradictory_audit_units_excluded_from_denominator(unit, key, remaining):
+    import copy
+    log = [{key: "conflict", "review_status": "verified"},
+           {key: "conflict", "review_status": "error"},
+           {key: "conflict", "review_status": "approved"}]
+    if remaining:
+        log += [{key: "clean", "review_status": "verified"},
+                {key: "error", "review_status": "rejected"}]
+    original = copy.deepcopy(log)
+    for ordered in (log, list(reversed(log))):
+        result = dq08_audited_error_rate(ordered, unit=unit)
+        assert result["unresolved_count"] == 1
+        assert "contradictory valid clean/error" in result["reason"]
+        assert result["denominator"] == (2 if remaining else 0)
+        assert result["numerator"] == (1 if remaining else 0)
+        assert result["value"] == (0.5 if remaining else None)
+        assert result["status"] == ("available" if remaining else "not_available")
+        if not remaining:
+            assert "denominator=0" in result["reason"]
+    assert log == original
+
+
+def test_invalid_review_does_not_contradict_valid_review():
+    result = dq08_audited_error_rate([
+        {"image_key": "i1", "review_status": "verified"},
+        {"image_key": "i1", "review_status": "typo", "has_error": True}])
+    assert result["value"] == 0.0 and result["denominator"] == 1
+    assert result["unresolved_count"] == 0
+    assert "invalid status" in result["reason"]
+
+
+def test_confirmed_error_flag_preserves_legitimate_audit_behavior():
+    result = dq08_audited_error_rate([
+        {"object_key": "o1", "review_status": "verified", "confirmed_error": True},
+        {"object_key": "o1", "review_status": "label_error"}], unit="object")
+    assert result["value"] == 1.0 and result["denominator"] == 1
+
+
+def test_object_reviews_cannot_be_relabelled_as_image_reviews():
+    log = [{"unit": "image", "image_key": "i1", "object_key": "o1",
+            "review_status": "verified"}]
+    for unit in ("image", "object"):
+        result = dq08_audited_error_rate(log, unit=unit)
+        assert result["value"] is None and result["denominator"] == 0
+
+
+def test_unsupported_audit_unit_is_unavailable():
+    result = dq08_audited_error_rate([
+        {"image_key": "i1", "review_status": "verified"}], unit="annotation")
+    assert result["value"] is None and "Unsupported audit unit" in result["reason"]

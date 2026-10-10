@@ -1351,34 +1351,54 @@ def dq07_duplicate_record_rate(
         }
 
     if duplicate_groups is not None:
-        # Support both flat tabular records (image_key, group_id, confirmed) from Coding Spec §2
-        # and pre-aggregated group dicts (group_id, image_keys, confirmed)
-        is_flat = any("image_key" in g and "image_keys" not in g for g in duplicate_groups)
-        if is_flat:
-            confirmed_groups_by_id: dict[str, list[str]] = {}
-            for row in duplicate_groups:
-                if row.get("confirmed") in (True, 1):
-                    gid = str(row.get("group_id", "default"))
-                    img_k = row.get("image_key")
-                    if img_k is not None:
-                        confirmed_groups_by_id.setdefault(gid, []).append(str(img_k))
-            redundant_count = sum(max(0, len(keys) - 1) for keys in confirmed_groups_by_id.values())
-        else:
-            confirmed_groups = [g for g in duplicate_groups if g.get("confirmed") in (True, 1)]
-            redundant_count = sum(max(0, len(g.get("image_keys", [])) - 1) for g in confirmed_groups)
-        rate = redundant_count / total_records
+        # Group membership is evidence only for records in this measurement.
+        # Repeated members of one group count once; overlapping distinct groups
+        # are unresolved evidence, not an implicit transitive duplicate class.
+        scoped_keys = set()
+        for record in records:
+            member = key(record) if callable(key) else (
+                record.get(key) if isinstance(record, dict) else getattr(record, key, None)
+            )
+            if isinstance(member, str) and member.strip():
+                scoped_keys.add(member)
+        groups: dict[str, set[str]] = {}
+        invalid_reason = None
+        excluded_members = set()
+        if len(scoped_keys) == 0:
+            invalid_reason = "Measurement scope has no usable record keys."
+        for index, row in enumerate(duplicate_groups):
+            if not isinstance(row, dict):
+                invalid_reason = "Malformed duplicate group record."
+                break
+            if row.get("confirmed") not in (True, 1):
+                continue
+            group_id = str(row.get("group_id", f"group-{index}"))
+            members = row.get("image_keys") if "image_keys" in row else [row.get("image_key")]
+            if not isinstance(members, list) or any(not isinstance(m, str) or not m.strip() for m in members):
+                invalid_reason = "Confirmed duplicate group has invalid member keys."
+                break
+            excluded_members.update(set(members) - scoped_keys)
+            groups.setdefault(group_id, set()).update(set(members) & scoped_keys)
+        seen = set()
+        for members in groups.values():
+            if seen & members:
+                invalid_reason = "Overlapping confirmed duplicate groups in measurement scope; resolve memberships before measuring."
+                break
+            seen.update(members)
+        redundant_count = sum(max(0, len(members) - 1) for members in groups.values())
+        available = invalid_reason is None
         return {
             "metric_id": "DQ07",
             "scope": "dataset",
             "key": "confirmed_duplicate_group",
             "unit": unit,
-            "numerator": redundant_count,
+            "numerator": redundant_count if available else None,
             "denominator": total_records,
-            "value": rate,
-            "status": "available",
-            "reason": None,
-            "duplicate_count": redundant_count,
-            "unique_count": total_records - redundant_count,
+            "value": redundant_count / total_records if available else None,
+            "status": "available" if available else "not_available",
+            "reason": invalid_reason or ("Group members outside measurement scope were excluded." if excluded_members else None),
+            "duplicate_count": redundant_count if available else None,
+            "unique_count": total_records - redundant_count if available else None,
             "definition_version": "1.0",
             "config_version": "1",
         }
@@ -1431,7 +1451,9 @@ def dq08_audited_error_rate(
     CRITICAL SEMANTICS:
     - NEVER fabricate review-log data. When review log is absent (None or empty),
       returns value=None, status="not_available" with explicit reason.
-    - An 'unknown' review status does NOT prove the unit has been reviewed.
+    - Only verified/approved and explicit error statuses count as valid reviews.
+    - Count unique image/object units separately. Contradictory clean/error
+      reviews leave the unit unresolved and excluded from the denominator.
     - Zero denominator must produce None / not_available, never 0%.
     """
     if review_log is None or len(review_log) == 0:
@@ -1448,46 +1470,59 @@ def dq08_audited_error_rate(
             "reference": reference,
             "reviewed_count": 0,
             "error_count": 0,
+            "unresolved_count": 0,
             "definition_version": "1.0",
             "config_version": "1",
         }
 
-    reviewed_entries: list[dict[str, Any]] = []
+    clean_statuses = {"verified", "approved"}
+    error_statuses = {"error", "rejected", "label_error", "metadata_error"}
+    outcomes: dict[str, set[bool]] = {}
+    excluded_reviews = 0
     for entry in review_log:
-        status = str(entry.get("review_status", "")).lower().strip()
-        if status in ("unknown", "unreviewed", "pending", ""):
+        if not isinstance(entry, dict):
+            excluded_reviews += 1
             continue
-        reviewed_entries.append(entry)
+        # Object reviews may carry an image_key identifying their parent. They
+        # are still object units and must not enter the image denominator.
+        entry_unit = entry.get("unit")
+        if entry_unit is None:
+            entry_unit = "object" if "object_key" in entry else "image"
+        if unit not in ("image", "object") or entry_unit != unit:
+            continue
+        if unit == "image" and "object_key" in entry:
+            excluded_reviews += 1
+            continue
+        identity = entry.get(f"{unit}_key")
+        status = entry.get("review_status")
+        status = status.strip().lower() if isinstance(status, str) else None
+        if (not isinstance(identity, str) or not identity.strip()
+                or status not in clean_statuses | error_statuses):
+            excluded_reviews += 1
+            continue
+        is_error = (status in error_statuses or entry.get("has_error") is True
+                    or entry.get("confirmed_error") is True)
+        outcomes.setdefault(identity, set()).add(is_error)
 
-    reviewed_count = len(reviewed_entries)
+    unresolved_count = sum(len(values) > 1 for values in outcomes.values())
+    eligible = [values for values in outcomes.values() if len(values) == 1]
+    reviewed_count = len(eligible)
+    error_count = sum(True in values for values in eligible)
+    reasons = []
+    if unresolved_count:
+        reasons.append(
+            f"Excluded {unresolved_count} unresolved audit unit(s) with contradictory "
+            "valid clean/error reviews."
+        )
+    if excluded_reviews:
+        reasons.append(
+            f"Excluded {excluded_reviews} review record(s) with invalid status, "
+            "missing identity, or inconsistent unit."
+        )
     if reviewed_count == 0:
-        return {
-            "metric_id": "DQ08",
-            "scope": "dataset",
-            "unit": unit,
-            "numerator": 0,
-            "denominator": 0,
-            "value": None,
-            "status": "not_available",
-            "reason": "No reviewed units in review log (denominator=0)",
-            "reviewer": reviewer,
-            "reference": reference,
-            "reviewed_count": 0,
-            "error_count": 0,
-            "definition_version": "1.0",
-            "config_version": "1",
-        }
-
-    def _is_error(entry: dict[str, Any]) -> bool:
-        if entry.get("has_error") is True or entry.get("confirmed_error") is True:
-            return True
-        status = str(entry.get("review_status", "")).lower().strip()
-        if status in ("error", "rejected", "label_error", "metadata_error"):
-            return True
-        return False
-
-    error_count = sum(1 for e in reviewed_entries if _is_error(e))
-    rate = error_count / reviewed_count
+        reasons.insert(0, "No eligible consistently reviewed units (denominator=0).")
+    if unit not in ("image", "object"):
+        reasons.insert(0, "Unsupported audit unit; use image or object.")
 
     return {
         "metric_id": "DQ08",
@@ -1495,13 +1530,14 @@ def dq08_audited_error_rate(
         "unit": unit,
         "numerator": error_count,
         "denominator": reviewed_count,
-        "value": rate,
-        "status": "available",
-        "reason": None,
+        "value": error_count / reviewed_count if reviewed_count else None,
+        "status": "available" if reviewed_count else "not_available",
+        "reason": " ".join(reasons) or None,
         "reviewer": reviewer,
         "reference": reference,
         "reviewed_count": reviewed_count,
         "error_count": error_count,
+        "unresolved_count": unresolved_count,
         "definition_version": "1.0",
         "config_version": "1",
     }

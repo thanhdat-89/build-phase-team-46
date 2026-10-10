@@ -138,6 +138,10 @@ def resolve_cvat_url(
         return ""
 
     if isinstance(entry, dict):
+        # Legacy entries without a confirmation field retain their API contract.
+        # An explicit denial (or malformed confirmation) must never emit a link.
+        if "confirmed" in entry and entry["confirmed"] is not True:
+            return ""
         if "url" in entry and isinstance(entry["url"], str):
             cleaned = entry["url"].strip()
             if cleaned.startswith("http://") or cleaned.startswith("https://"):

@@ -853,3 +853,30 @@ class TestEndToEndPhase1To3Integration:
         cfg_out = json.loads(bundle.config_json)
         assert len(cfg_out["slices"]) == 2
         assert cfg_out["config_version"] == "v1.0"
+
+@pytest.mark.parametrize("destination", ["url", "task_frame"])
+@pytest.mark.parametrize("lookup", ["canonical", "path", "short", "callable"])
+@pytest.mark.parametrize("confirmation", [False, None, "true", 1],
+                         ids=["false", "null", "string_true", "integer_one"])
+def test_explicitly_unconfirmed_cvat_mapping_never_exported(destination, lookup, confirmation):
+    import copy
+    image = ImageRecord(dataset_id="ds1", image_id="img", image_path="actual/path.jpg", width=100, height=100)
+    entry = ({"confirmed": confirmation, "url": "https://cvat.example/tasks/1?frame=0"} if destination == "url"
+             else {"confirmed": confirmation, "base_url": "https://cvat.example", "task_id": 1, "frame": 0})
+    mapping = (lambda key: entry) if lookup == "callable" else {
+        {"canonical": image.image_key, "path": image.image_path, "short": image.image_id}[lookup]: entry}
+    original = copy.deepcopy(entry)
+    assert resolve_cvat_url(image.image_key, image.image_path, mapping) == ""
+    cfg = CoverageConfig(slices=[_slice(target_count=2)])
+    evaluation = _eval_result(support=1, target_count=2, matched_keys=[image.image_key])
+    recs = recommend({"s1": evaluation}, config=cfg, images=[image])
+    assert recs and recs[0].affected_image_keys == [image.image_key]
+    bundle = export_coverage_bundle(slice_results={"s1": evaluation}, recommendations=recs,
+                                   config=cfg, images=[image], cvat_mapping=mapping,
+                                   dataset_version="test-version")
+    affected = list(csv.DictReader(io.StringIO(bundle.affected_images_csv)))
+    assert affected and all(row["cvat_url"] == "" and row["image_path"] == image.image_path for row in affected)
+    assert next(csv.reader(io.StringIO(bundle.affected_images_csv))) == AFFECTED_IMAGES_CSV_HEADERS
+    assert entry == original
+    entry["confirmed"] = True
+    assert resolve_cvat_url(image.image_key, image.image_path, mapping) == "https://cvat.example/tasks/1?frame=0"
