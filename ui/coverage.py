@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pandas as pd
@@ -264,6 +265,7 @@ def compute_coverage_cache_key(
         img_payload = [
             img.dataset_id,
             img.image_id,
+            img.image_path,
             img.width,
             img.height,
             img.timeofday,
@@ -310,6 +312,8 @@ def recalculate_coverage(
     config: CoverageConfig,
     sources: dict[str, str] | list[dict[str, Any]] | None = None,
     dataset_version: str = "",
+    dataset_id: str = "dataset",
+    include_skipped: bool = False,
 ) -> tuple[dict[str, SliceEvaluationResult], DatasetCoverageResult, list[Recommendation]]:
     """Deterministically recalculate slice evaluations, dataset coverage metrics, and recommendations."""
     slice_results = measure_slices(
@@ -317,7 +321,17 @@ def recalculate_coverage(
         objects=objects,
         config=config,
         sources=sources,
-    )
+    ) if images or objects else {}
+
+    # The engine stores 0.0 availability for an empty unit denominator.
+    # Remove only unavailable field rates before metrics AND recommendations;
+    # genuine zero rates over non-empty collections remain measurements.
+    slice_results = {
+        key: replace(result, metadata_availability={})
+        if not (images if result.unit == "image" else objects)
+        else result
+        for key, result in slice_results.items()
+    }
 
     dataset_coverage = calculate_dataset_coverage(
         slice_results=slice_results,
@@ -329,6 +343,8 @@ def recalculate_coverage(
         config=config,
         images=images,
         dataset_version=dataset_version,
+        dataset_id=dataset_id,
+        include_skipped=include_skipped,
     )
 
     return slice_results, dataset_coverage, recommendations
@@ -341,6 +357,8 @@ def recalculate_coverage(
 def prepare_slice_table_data(
     slice_results: dict[str, SliceEvaluationResult],
     config: CoverageConfig,
+    images: list[ImageRecord] | None = None,
+    objects: list[ObjectRecord] | None = None,
 ) -> list[dict[str, Any]]:
     """Format per-slice metrics for clean tabular display in the UI.
 
@@ -354,24 +372,25 @@ def prepare_slice_table_data(
     for s_def in config.slices:
         eval_res = slice_results.get(s_def.id)
 
-        support = eval_res.support if eval_res is not None else 0
+        support = eval_res.support if eval_res is not None else None
         target = s_def.target_count
-        gap = eval_res.gap if eval_res is not None else target
-        attainment = eval_res.attainment if eval_res is not None else 0.0
-        priority = eval_res.priority if eval_res is not None else float(s_def.weight)
-        unres_count = eval_res.unresolved_count if eval_res is not None else 0
-        is_prov = unres_count > 0
+        gap = eval_res.gap if eval_res is not None else None
+        attainment = eval_res.attainment if eval_res is not None else None
+        priority = eval_res.priority if eval_res is not None else None
+        unres_count = eval_res.unresolved_count if eval_res is not None else None
+        is_prov = unres_count is not None and unres_count > 0
 
         # Format metadata availability details
         if eval_res is not None and eval_res.metadata_availability:
             avail_parts = [
-                f"{k}: {v * 100:.0f}%" for k, v in eval_res.metadata_availability.items()
+                f"{k}: {v * 100:.1f}%" for k, v in eval_res.metadata_availability.items()
             ]
-            meta_status = ", ".join(avail_parts)
+            records = images if s_def.unit == "image" else objects
+            meta_status = ", ".join(avail_parts) if records is not None and len(records) > 0 else "N/A"
         elif is_prov:
             meta_status = f"Thiếu metadata ({unres_count} bản ghi chưa rõ)"
         else:
-            meta_status = "Đầy đủ"
+            meta_status = "N/A"
 
         # Format source support
         if eval_res is not None and eval_res.source_support is not None:
@@ -399,11 +418,11 @@ def prepare_slice_table_data(
                 "support": support,
                 "target_count": target,
                 "gap": gap,
-                "attainment_pct": round(attainment * 100, 1),
+                "attainment_pct": round(attainment * 100, 1) if attainment is not None else None,
                 "weight": s_def.weight,
-                "priority": round(priority, 2),
+                "priority": round(priority, 2) if priority is not None else None,
                 "unresolved_count": unres_count,
-                "provisional_status": "⚠️ Tạm thời (Provisional)" if is_prov else "✅ Đã xác nhận (Confirmed)",
+                "provisional_status": "⚠️ Tạm thời (Provisional)" if is_prov else ("Quan sát từ annotation" if eval_res is not None else "N/A"),
                 "metadata_availability": meta_status,
                 "source_support": source_display,
                 "status": status_text,
@@ -419,6 +438,15 @@ def prepare_slice_table_data(
 # Streamlit Rendering
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class CoverageSnapshot:
+    config: CoverageConfig
+    slice_results: dict[str, SliceEvaluationResult]
+    dataset_result: DatasetCoverageResult
+    recommendations: list[Recommendation]
+    dataset_version: str
+
+
 def render_coverage(
     images: list[ImageRecord],
     valid_objects: list[ObjectRecord] | None = None,
@@ -426,7 +454,9 @@ def render_coverage(
     config: CoverageConfig | None = None,
     sources: dict[str, str] | list[dict[str, Any]] | None = None,
     dataset_version: str = "",
-) -> None:
+    dataset_id: str = "dataset",
+    include_skipped: bool = False,
+) -> CoverageSnapshot | None:
     """Render the full Coverage Dashboard UI tab in Streamlit."""
     target_objects = valid_objects if valid_objects is not None else (objects or [])
 
@@ -449,6 +479,12 @@ def render_coverage(
 
     active_config: CoverageConfig = st.session_state["coverage_config"]
 
+    validation = validate_coverage_config(active_config)
+    if not validation.valid:
+        for error in validation.errors:
+            st.error(error)
+        return None
+
     # 2. Compute reliable dataset/config cache key
     current_cache_key = compute_coverage_cache_key(
         images=images,
@@ -464,6 +500,8 @@ def render_coverage(
         cached_key != current_cache_key
         or "coverage_slice_results" not in st.session_state
         or "coverage_dataset_result" not in st.session_state
+        or "coverage_recommendations" not in st.session_state
+        or st.session_state.get("coverage_rule_context") != (dataset_id, include_skipped)
     ):
         s_res, d_cov, recs = recalculate_coverage(
             images=images,
@@ -471,7 +509,9 @@ def render_coverage(
             config=active_config,
             sources=sources,
             dataset_version=dataset_version,
+            dataset_id=dataset_id, include_skipped=include_skipped,
         )
+        st.session_state["coverage_rule_context"] = (dataset_id, include_skipped)
         st.session_state["coverage_slice_results"] = s_res
         st.session_state["coverage_dataset_result"] = d_cov
         st.session_state["coverage_recommendations"] = recs
@@ -544,7 +584,9 @@ def render_coverage(
     )
 
     # Quality Gate Banner
-    if dataset_cov.eligible_slices_count == 0:
+    if not images and not target_objects:
+        st.info("Empty import: coverage is N/A (|S| = 0); no records were evaluated.")
+    elif dataset_cov.eligible_slices_count == 0:
         st.info(
             "ℹ️ **Không có slice hợp lệ để đánh giá (|S| = 0):** "
             "Cấu hình chưa có slice nào được kích hoạt hoặc khả thi. "
@@ -587,7 +629,7 @@ def render_coverage(
         "thành tổng số ảnh cần thu thập."
     )
 
-    table_data = prepare_slice_table_data(slice_results=slice_results, config=active_config)
+    table_data = prepare_slice_table_data(slice_results=slice_results, config=active_config, images=images, objects=target_objects)
     df_slices = pd.DataFrame(table_data)
 
     if not df_slices.empty:
@@ -595,7 +637,7 @@ def render_coverage(
         support_colors = [
             "#adb5bd"
             if not row["enabled"]
-            else ("#e67700" if row["unresolved_count"] > 0 else "#2b8a3e")
+            else ("#e67700" if pd.notna(row["unresolved_count"]) and row["unresolved_count"] > 0 else "#2b8a3e")
             for _, row in df_slices.iterrows()
         ]
         status_labels = [
@@ -603,8 +645,8 @@ def render_coverage(
             if not row["enabled"]
             else (
                 f"⚠️ Tạm thời (Provisional: {row['unresolved_count']} bản ghi chưa rõ)"
-                if row["unresolved_count"] > 0
-                else "✅ Đã xác nhận (Confirmed)"
+                if pd.notna(row["unresolved_count"]) and row["unresolved_count"] > 0
+                else row["provisional_status"]
             )
             for _, row in df_slices.iterrows()
         ]
@@ -641,10 +683,10 @@ def render_coverage(
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             margin=dict(l=20, r=20, t=60, b=40),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.caption(
             "🎨 **Chú giải màu sắc:** "
-            "🟢 Xanh lá (`#2b8a3e`): Mẫu thực tế đã xác nhận | "
+            "🟢 Xanh lá (`#2b8a3e`): Mẫu quan sát từ annotation | "
             "🟠 Cam hổ phách (`#e67700`): Mẫu tạm thời do còn metadata chưa rõ | "
             "⚪ Xám (`#868e96`): Mục tiêu kế hoạch."
         )
@@ -670,7 +712,7 @@ def render_coverage(
                 "enabled": "Kích hoạt",
                 "feasibility": "Tính khả thi",
             },
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -709,7 +751,7 @@ def render_coverage(
                 new_target_val = st.number_input(
                     "Mục tiêu số lượng (target_count):",
                     min_value=1,
-                    max_value=100000,
+                    max_value=max(100000, int(selected_slice_def.target_count)),
                     value=int(selected_slice_def.target_count),
                     step=1,
                     key=f"target_input_{selected_slice_id}",
@@ -720,7 +762,7 @@ def render_coverage(
                 new_weight_val = st.number_input(
                     "Trọng số ưu tiên (weight):",
                     min_value=0.1,
-                    max_value=100.0,
+                    max_value=max(100.0, float(selected_slice_def.weight)),
                     value=float(selected_slice_def.weight),
                     step=0.5,
                     key=f"weight_input_{selected_slice_id}",
@@ -737,7 +779,7 @@ def render_coverage(
             st.caption(f"Lý do đặt mục tiêu hiện tại: *{selected_slice_def.target_reason or 'Chưa ghi chú'}*")
 
             if st.button("💾 Áp dụng thay đổi & Tính lại chỉ số", type="primary", key="btn_apply_config"):
-                known_classes = {obj.class_name for obj in target_objects} if target_objects else None
+                known_classes = None  # Observed classes are not an authoritative label schema.
                 success, updated_config, msgs = apply_slice_config_edit(
                     current_config=active_config,
                     slice_id=selected_slice_id,
@@ -760,6 +802,7 @@ def render_coverage(
                             config=updated_config,
                             sources=sources,
                             dataset_version=dataset_version,
+                            dataset_id=dataset_id, include_skipped=include_skipped,
                         )
                         st.session_state["coverage_slice_results"] = s_res
                         st.session_state["coverage_dataset_result"] = d_cov
@@ -789,3 +832,6 @@ def render_coverage(
                 else:
                     for err in msgs:
                         st.error(f"❌ Lỗi cấu hình: {err}")
+
+    return CoverageSnapshot(active_config, slice_results, dataset_cov,
+                            st.session_state["coverage_recommendations"], dataset_version)

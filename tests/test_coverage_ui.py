@@ -325,7 +325,7 @@ class TestTableDataPreparation:
             status="met",
         )
 
-        rows = prepare_slice_table_data({"s_img": eval_1, "s_obj": eval_2}, cfg)
+        rows = prepare_slice_table_data({"s_img": eval_1, "s_obj": eval_2}, cfg, objects=[_obj()])
         assert len(rows) == 2
 
         row1 = rows[0]
@@ -336,7 +336,7 @@ class TestTableDataPreparation:
         assert row1["gap"] == 30
         assert row1["attainment_pct"] == 40.0
         assert row1["priority"] == 1.2
-        assert "Confirmed" in row1["provisional_status"]
+        assert "annotation" in row1["provisional_status"]
 
         row2 = rows[1]
         assert row2["slice_id"] == "s_obj"
@@ -346,7 +346,7 @@ class TestTableDataPreparation:
         assert row2["gap"] == 0
         assert row2["unresolved_count"] == 5
         assert "Provisional" in row2["provisional_status"]  # Unresolved triggers provisional!
-        assert "timeofday: 80%" in row2["metadata_availability"]
+        assert "timeofday: 80.0%" in row2["metadata_availability"]
 
     def test_overlapping_slice_gaps_never_summed_in_table(self):
         """Criterion 9: Overlapping slice gaps are never presented as a combined missing count."""
@@ -884,3 +884,51 @@ class TestRenderCoverageInteractiveAndBanners:
             support_trace = fig.data[0]
             # person_night_rain has missing weather -> provisional -> amber #e67700
             assert "#e67700" in support_trace.marker.color
+
+def test_path_cache_and_empty_disabled_unavailable_table():
+    from dataclasses import replace
+    img = _img()
+    cfg = get_default_coverage_config()
+    assert compute_coverage_cache_key([img], [], cfg) != compute_coverage_cache_key([replace(img, image_path="new.jpg")], [], cfg)
+    results, dataset, recs = recalculate_coverage([], [], cfg, include_skipped=True)
+    assert results == {} and dataset.coverage is None and not dataset.targets_met
+    table = prepare_slice_table_data(results, cfg, images=[], objects=[])
+    assert all(row["support"] is None and row["gap"] is None and row["metadata_availability"] == "N/A" for row in table)
+    disabled = replace(cfg, slices=[replace(s, enabled=False) for s in cfg.slices])
+    results, dataset, _ = recalculate_coverage([img], [], disabled)
+    assert not results and dataset.coverage is None
+    assert all(row["support"] is None and "Disabled" in row["status"] for row in prepare_slice_table_data(results, disabled))
+
+@pytest.mark.parametrize("unit", ["image", "object"])
+@pytest.mark.parametrize("denominator", ["unknown", "empty", "nonempty"])
+def test_availability_table_requires_known_nonempty_denominator(unit, denominator):
+    cfg = CoverageConfig(slices=[SliceDefinition(id="s", name="s", unit=unit, filters={}, target_count=2, weight=1)])
+    evaluation = SliceEvaluationResult(slice_id="s", slice_name="s", unit=unit, support=0, target_count=2,
+                                      weight=1, gap=2, attainment=0, priority=1,
+                                      metadata_availability={"timeofday": 0.0})
+    records = None if denominator == "unknown" else [] if denominator == "empty" else [_img() if unit == "image" else _obj()]
+    row = prepare_slice_table_data({"s": evaluation}, cfg, **({"images": records} if unit == "image" else {"objects": records}))[0]
+    assert row["metadata_availability"] == ("timeofday: 0.0%" if denominator == "nonempty" else "N/A")
+
+
+def test_shared_pipeline_empty_object_availability_and_real_metadata_findings():
+    from dataclasses import replace
+    img = _img(timeofday="night")
+    cfg = CoverageConfig(slices=[SliceDefinition(id="obj", name="Objects", unit="object",
+                         filters={"class_name": "person", "timeofday": "night"}, target_count=2, weight=3),
+                         SliceDefinition(id="img", name="Images", unit="image",
+                         filters={"timeofday": "night"}, target_count=2, weight=1)])
+    results, dataset, recs = recalculate_coverage([img], [], cfg)
+    assert results["obj"].metadata_availability == {}
+    assert dataset.slice_metrics["obj"]["metadata_availability"] == {}
+    assert results["obj"].unresolved_count == 0
+    assert not any("R06" in rec.rule_ids for rec in recs)
+    # Actual image metadata issues still trigger R06, including image slices.
+    results, _, recs = recalculate_coverage([replace(img, timeofday=None)], [], cfg)
+    assert results["obj"].metadata_availability == {}
+    assert results["img"].metadata_availability == {"timeofday": 0.0}
+    assert any("R06" in rec.rule_ids and rec.slice_id == "img" for rec in recs)
+    # Non-empty object denominator with genuinely unknown metadata stays zero.
+    results, _, recs = recalculate_coverage([replace(img, timeofday=None)], [_obj()], cfg)
+    assert results["obj"].metadata_availability == {"timeofday": 0.0}
+    assert any("R06" in rec.rule_ids and rec.slice_id == "obj" for rec in recs)
